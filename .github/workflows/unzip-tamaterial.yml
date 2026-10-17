@@ -1,0 +1,36 @@
+name: Unzip tamaterial-main-all-ui-ux-fixed.zip
+on:
+  workflow_dispatch:
+
+jobs:
+  unzip-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Ensure unzip installed
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Unzip archive
+        run: |
+          if [ -f "tamaterial-main-all-ui-ux-fixed.zip" ]; then
+            unzip -o tamaterial-main-all-ui-ux-fixed.zip -d .
+          else
+            echo "Zip file not found: tamaterial-main-all-ui-ux-fixed.zip" && exit 1
+          fi
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --staged --quiet; then
+            git commit -m "Unzip tamaterial-main-all-ui-ux-fixed.zip"
+            git push
+          else
+            echo "No changes to commit"
+          fi
