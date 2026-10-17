@@ -1,0 +1,1269 @@
+'use strict';
+/*
+ * TechAssures Lab server
+ * - Zero npm dependencies. Needs Node 22.5+ (built-in node:sqlite).
+ * - One SQLite file holds every record, a change feed (for multi-device sync) and an audit log.
+ * - Roles are enforced here, not in the browser: store/tester never receive prices or payments.
+ */
+process.env.TZ = process.env.TZ || 'Asia/Kolkata';
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { DatabaseSync } = require('node:sqlite');
+const L = require('./lib/logic');
+const N = require('./lib/notifier');
+const { buildSeed } = require('./lib/seed');
+
+const PORT = +process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'lab.db');
+const DEMO = process.env.DEMO_MODE !== '0';
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const SESSION_DAYS = 7;
+const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
+const APP_SECRET = process.env.APP_SECRET || crypto.randomBytes(32).toString('hex');
+const BODY_LIMIT = 8 * 1024 * 1024;
+
+const DATABASE_URL = process.env.DATABASE_URL || '';
+if (!DATABASE_URL) fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const db = new DatabaseSync(DATABASE_URL ? ':memory:' : DB_PATH);
+db.exec(`
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS records(org TEXT NOT NULL DEFAULT 'demo',coll TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,rev INTEGER NOT NULL,deleted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(org,coll,id));
+CREATE INDEX IF NOT EXISTS records_rev ON records(rev);
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,org TEXT NOT NULL DEFAULT 'demo',ts TEXT NOT NULL,user_id TEXT,user_name TEXT,action TEXT NOT NULL,coll TEXT,rec_id TEXT,summary TEXT);
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,org TEXT NOT NULL DEFAULT 'demo',user_id TEXT NOT NULL,expires INTEGER NOT NULL);
+`);
+
+/* ---------------- storage helpers ---------------- */
+const stmts = {};
+const st = sql => stmts[sql] || (stmts[sql] = db.prepare(sql));
+const metaGet = k => { const r = st('SELECT v FROM meta WHERE k=?').get(k); return r ? r.v : null; };
+const metaSet = (k, v) => st('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v));
+let ORG = 'demo';                       /* the lab (tenant) the current request belongs to */
+const withOrg = (o, fn) => { const prev = ORG; ORG = o; try { return fn(); } finally { ORG = prev; } };
+const ctr = n => +metaGet(n + ':' + ORG) || 0;
+const ctrSet = (n, v) => metaSet(n + ':' + ORG, v);
+const nextRev = () => { const r = (+metaGet('rev') || 0) + 1; metaSet('rev', r); return r; };
+const get = (coll, id) => { const r = st('SELECT data FROM records WHERE org=? AND coll=? AND id=? AND deleted=0').get(ORG, coll, id); return r ? JSON.parse(r.data) : null; };
+const all = coll => st('SELECT data FROM records WHERE org=? AND coll=? AND deleted=0').all(ORG, coll).map(r => JSON.parse(r.data));
+function tx(fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { try { db.exec('ROLLBACK'); } catch (x) { /* ignore */ } throw e; }
+}
+function audit(actor, action, coll, recId, summary) {
+  st('INSERT INTO audit(org,ts,user_id,user_name,action,coll,rec_id,summary) VALUES(?,?,?,?,?,?,?,?)')
+    .run(ORG, new Date().toISOString(), actor ? actor.id : null, actor ? actor.name : 'system', action, coll || null, recId || null, String(summary || '').slice(0, 400));
+}
+const SKIP_DIFF = { file: 1, photo: 1, sig: 1, rep: 1, hash: 1, salt: 1 };
+function diffSummary(old, obj) {
+  if (!old) return 'created';
+  const out = [];
+  Object.keys(obj).forEach(k => {
+    if (SKIP_DIFF[k]) return;
+    const a = old[k], b = obj[k];
+    if (JSON.stringify(a) === JSON.stringify(b)) return;
+    const sc = v => (v == null || typeof v === 'object') ? null : String(v);
+    const x = sc(a), y = sc(b);
+    out.push(x != null && y != null && x.length < 40 && y.length < 40 ? k + ': ' + x + ' → ' + y : k + ' changed');
+  });
+  return out.length ? out.join('; ') : 'saved (no field changes)';
+}
+function put(coll, obj, actor, action, summary) {
+  const old = get(coll, obj.id), rev = nextRev();
+  st('INSERT INTO records(org,coll,id,data,rev,deleted) VALUES(?,?,?,?,?,0) ON CONFLICT(org,coll,id) DO UPDATE SET data=excluded.data,rev=excluded.rev,deleted=0')
+    .run(ORG, coll, obj.id, JSON.stringify(obj), rev);
+  audit(actor, action || (old ? 'update' : 'create'), coll, obj.id, summary || diffSummary(old, obj));
+  return obj;
+}
+function del(coll, id, actor) {
+  const old = get(coll, id); if (!old) return false;
+  st('UPDATE records SET deleted=1,rev=? WHERE org=? AND coll=? AND id=?').run(nextRev(), ORG, coll, id);
+  audit(actor, 'delete', coll, id, old.name || old.title || old.summary || '');
+  return true;
+}
+
+/* ---------------- errors & validation ---------------- */
+class ApiError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+const bad = (m, s) => { throw new ApiError(s || 400, m); };
+function str(v, max, o) {
+  o = o || {};
+  const s = v == null ? '' : String(v).trim();
+  if (o.req && !s) bad(o.req);
+  if (s.length > max) bad('Text is too long (max ' + max + ' characters)');
+  return s;
+}
+const isId = s => typeof s === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(s);
+const rid = () => crypto.randomBytes(5).toString('hex');
+function money(v, label) { const n = L.num(v); if (isNaN(n) || n < 0 || n > 1e9) bad(label + ' must be a number, 0 or more'); return n; }
+
+/* ---------------- users, auth ---------------- */
+const ROLES = ['admin', 'store', 'tester', 'accounts', 'reviewer'];
+const hashPin = (pin, salt) => crypto.scryptSync(String(pin), salt, 32).toString('hex');
+function newCred(pin) { const salt = crypto.randomBytes(16).toString('hex'); return { salt, hash: hashPin(pin, salt) }; }
+function pinOk(u, pin) {
+  if (!u.salt || !u.hash) return false;            /* Google-only user: no PIN set */
+  try { return crypto.timingSafeEqual(Buffer.from(hashPin(pin, u.salt), 'hex'), Buffer.from(u.hash, 'hex')); } catch (e) { return false; }
+}
+// signatory is reviewer-only and defaults to true (an existing reviewer with the field unset,
+// from before this flag existed, keeps signing exactly as before) — only an explicit false locks it.
+const isSignatory = u => u.role === 'reviewer' && u.signatory !== false;
+const pubUser = (u, full) => full ? { id: u.id, login: u.login, email: u.email || '', name: u.name, role: u.role, active: u.active, authorisedTests: u.authorisedTests || [], signatory: u.role === 'reviewer' ? isSignatory(u) : false } : { id: u.id, name: u.name, role: u.role, active: u.active };
+const sha = t => crypto.createHash('sha256').update(t).digest('hex');
+function newSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  st('INSERT INTO sessions(token_hash,org,user_id,expires) VALUES(?,?,?,?)').run(sha(token), ORG, userId, Date.now() + SESSION_DAYS * 864e5);
+  return token;
+}
+function authUser(req) {
+  const h = req.headers.authorization || '';
+  const m = /^Bearer ([a-f0-9]{64})$/.exec(h);
+  if (!m) return null;
+  const s = st('SELECT org,user_id,expires FROM sessions WHERE token_hash=?').get(sha(m[1]));
+  if (!s || s.expires < Date.now()) return null;
+  { const o = findOrg(s.org); if (o && o.suspended) return null; }
+  ORG = s.org;
+  const u = get('users', s.user_id);
+  if (!u || !u.active) return null;
+  u.org = s.org;
+  return u;
+}
+const attempts = new Map();
+function throttle(key) {
+  const a = attempts.get(key);
+  if (a && a.until > Date.now()) bad('Too many wrong attempts. Try again in a few minutes.', 429);
+}
+function failed(key) {
+  const a = attempts.get(key) || { n: 0, until: 0 };
+  a.n++; if (a.n >= 5) { a.until = Date.now() + 10 * 60e3; a.n = 0; }
+  attempts.set(key, a);
+}
+
+/* ---------------- seed ---------------- */
+const COLLS = ['users', 'tests', 'clients', 'projects', 'samples', 'jobs', 'invoices', 'payments', 'leads', 'interactions', 'tasks', 'notifications', 'tickets', 'workorders', 'vendorbills', 'quotes', 'ratebook'];
+function seedDb() {                       /* the demo lab: ORG must be 'demo' */
+  const seed = buildSeed(), rev = nextRev();
+  const ins = st('INSERT INTO records(org,coll,id,data,rev,deleted) VALUES(?,?,?,?,?,0) ON CONFLICT(org,coll,id) DO UPDATE SET data=excluded.data,rev=excluded.rev,deleted=0');
+  seed.records.users = seed.records.users.map(u => { const c = newCred(u.pin); return { id: u.id, login: u.login, name: u.name, role: u.role, active: u.active, salt: c.salt, hash: c.hash }; });
+  COLLS.forEach(c => (seed.records[c] || []).forEach(r => ins.run(ORG, c, r.id, JSON.stringify(r), rev)));
+  ins.run(ORG, 'settings', 'main', JSON.stringify(Object.assign({ id: 'main' }, seed.settings)), rev);
+  ctrSet('uid', seed.counters.uid); ctrSet('inv', seed.counters.inv); metaSet('seeded', '1');
+}
+/* a brand-new lab starts with the standard test catalogue, settings and no clients or samples */
+function seedBlank(admin) {
+  const seed = buildSeed(), rev = nextRev();
+  const ins = st('INSERT INTO records(org,coll,id,data,rev,deleted) VALUES(?,?,?,?,?,0) ON CONFLICT(org,coll,id) DO UPDATE SET data=excluded.data,rev=excluded.rev,deleted=0');
+  seed.records.tests.forEach(r => ins.run(ORG, 'tests', r.id, JSON.stringify(r), rev));
+  ins.run(ORG, 'settings', 'main', JSON.stringify(Object.assign({ id: 'main' }, seed.settings)), rev);
+  ins.run(ORG, 'users', admin.id, JSON.stringify(admin), rev);
+  ctrSet('uid', 1); ctrSet('inv', 1);
+}
+const sysOrgs = () => withOrg('_sys', () => all('orgs'));
+const findOrg = slug => sysOrgs().find(o => o.slug === slug) || null;
+function putOrg(o) { withOrg('_sys', () => put('orgs', o, null, 'create', 'Lab ' + o.name + ' created')); }
+function seedIfEmpty() {
+  tx(() => {
+    if (!metaGet('seeded')) withOrg('demo', () => { seedDb(); audit(null, 'seed', null, null, 'Demo data loaded'); });
+    else withOrg('demo', () => { if (!ctr('uid') && metaGet('uid')) { ctrSet('uid', metaGet('uid')); ctrSet('inv', metaGet('inv')); } });   /* upgrade from the single-lab version */
+    withOrg('demo', () => { if (!all('users').some(x => x.role === 'reviewer')) { const c = newCred('6666'); put('users', { id: 'u_priya', login: 'priya', name: 'Priya', role: 'reviewer', active: true, salt: c.salt, hash: c.hash }, null, 'create', 'Demo reviewer added'); } });
+    if (!findOrg('demo')) putOrg({ id: 'demo', slug: 'demo', name: 'Demo Lab', plan: 'demo', createdOn: L.today(), ownerEmail: '' });
+  });
+}
+let pg = null, ready = Promise.resolve();
+if (DATABASE_URL) {
+  pg = require('./lib/pgsync')(DATABASE_URL, db);
+  ready = (async () => { await pg.init(); seedIfEmpty(); await pg.flush(); })();
+  ready.catch(e => { console.error('Database start-up failed:', e.message); process.exit(1); });
+} else seedIfEmpty();
+const DEMO_PINS = { admin: '1111', rahul: '2222', suresh: '3333', meera: '4444', imran: '5555', priya: '6666' };
+
+/* ---------------- role-based views ---------------- */
+const MONEY_ROLES = ['admin', 'accounts'];
+const CRM_ROLES = ['admin', 'accounts'];
+function assignedSet(u) {
+  if (u.role !== 'tester') return null;
+  return new Set(all('jobs').filter(j => j.assignee === u.id).map(j => j.sampleId));
+}
+function shape(u, coll, r, asg) {
+  switch (coll) {
+    case 'users': return pubUser(r, u.role === 'admin');
+    case 'tests': if (u.role === 'store' || u.role === 'tester' || u.role === 'reviewer') { const t = Object.assign({}, r); delete t.rate; return t; } return r;
+    case 'clients':
+      if (u.role === 'tester') return null;
+      if (u.role === 'store' || u.role === 'reviewer') { const c = Object.assign({}, r); delete c.rates; return c; }
+      return r;
+    case 'projects': return u.role === 'tester' ? null : r;
+    case 'samples':
+      if (u.role !== 'tester') return r;
+      if (!asg.has(r.id)) return null;
+      { const s = Object.assign({}, r); ['clientId', 'projectId', 'billing', 'sampledBy', 'rep', 'invoiceId', 'billNo', 'createdBy'].forEach(k => delete s[k]); return s; }
+    case 'jobs': return u.role === 'tester' && r.assignee !== u.id ? null : r;
+    case 'invoices': case 'payments': return MONEY_ROLES.includes(u.role) ? r : null;
+    case 'leads': case 'interactions': case 'tasks': return CRM_ROLES.includes(u.role) ? r : null;
+    case 'workorders': { if (!MONEY_ROLES.includes(u.role)) return null; const w = Object.assign({}, r); delete w.file; return w; }
+    case 'vendorbills': case 'quotes': case 'ratebook': return MONEY_ROLES.includes(u.role) ? r : null;
+    case 'tickets': return (u.role === 'admin' || r.raisedBy === u.id || r.assignee === u.id) ? r : null;
+    case 'notifications': return r.userId === u.id ? r : null;      /* everyone sees only their own */
+    default: return null;
+  }
+}
+function shapeSettings(u, s) {
+  if (!s) return {};
+  if (u.role === 'admin' || u.role === 'accounts') return { cert: s.cert, gst: s.gst, creditDays: s.creditDays, machines: s.machines || 'CTM-01' };
+  return { cert: s.cert, machines: s.machines || 'CTM-01' };
+}
+function counters(u) { return (u.role === 'admin' || u.role === 'store') ? { uid: ctr('uid'), inv: ctr('inv') } : {}; }
+function snapshot(u) {
+  const asg = assignedSet(u), out = {};
+  COLLS.forEach(c => { out[c] = all(c).map(r => shape(u, c, r, asg)).filter(Boolean); });
+  out.settings = shapeSettings(u, get('settings', 'main'));
+  out.counters = counters(u);
+  const o = findOrg(u.org) || {};
+  return { rev: +metaGet('rev'), data: out, org: { slug: o.slug, name: o.name, plan: o.plan, demo: o.slug === 'demo' } };
+}
+function changes(u, since) {
+  const rev = +metaGet('rev');
+  if (since > rev) return { reload: true, rev };
+  const rows = st('SELECT coll,id,data,deleted FROM records WHERE org=? AND rev>? ORDER BY rev').all(ORG, since);
+  const asg = assignedSet(u), up = {}, dl = {};
+  rows.forEach(r => {
+    if (r.deleted) { (dl[r.coll] = dl[r.coll] || []).push(r.id); return; }
+    const rec = JSON.parse(r.data);
+    if (r.coll === 'settings') { up.settings = shapeSettings(u, rec); return; }
+    const v = shape(u, r.coll, rec, asg);
+    if (v) (up[r.coll] = up[r.coll] || []).push(v);
+  });
+  if (u.role === 'tester' && up.jobs) {
+    const have = new Set((up.samples || []).map(s => s.id));
+    up.jobs.forEach(j => { if (!have.has(j.sampleId)) { const s = get('samples', j.sampleId); const v = s && shape(u, 'samples', s, asg); if (v) { (up.samples = up.samples || []).push(v); have.add(j.sampleId); } } });
+  }
+  return { rev, upserts: up, deletes: dl, counters: counters(u) };
+}
+
+/* ---------------- generic config collections ---------------- */
+const GENERIC = {
+  tests: { roles: ['admin'] },
+  clients: { roles: ['admin', 'accounts'] },
+  projects: { roles: ['admin', 'accounts', 'store'] },
+  leads: { roles: CRM_ROLES, deletable: true },
+  interactions: { roles: CRM_ROLES, deletable: true },
+  tasks: { roles: CRM_ROLES, deletable: true },
+  settings: { roles: ['admin'] },
+  workorders: { roles: ['admin', 'accounts'], deletable: true },
+  vendorbills: { roles: ['admin', 'accounts'], deletable: true },
+  quotes: { roles: ['admin', 'accounts'], deletable: true },
+  ratebook: { roles: ['admin', 'accounts'] }
+};
+const LEAD_STAGES = ['new', 'contacted', 'quoted', 'won', 'lost'];
+const INT_TYPES = ['call', 'visit', 'email', 'whatsapp', 'note'];
+const optDate = (v, label) => { if (v === '' || v == null) return ''; if (!L.isDate(v)) bad(label + ' is not a valid date'); return v; };
+const optUser = (v, label) => { if (!v) return ''; const u = get('users', v); if (!u) bad(label + ' is not a known user'); return v; };
+const optClient = v => { if (!v) return ''; if (!get('clients', v)) bad('Unknown client'); return v; };
+
+function clean(coll, b, old, actor) {
+  const id = b.id;
+  if (coll === 'settings') {
+    if (id !== 'main') bad('Unknown settings record');
+    const gst = L.num(b.gst), cd = parseInt(b.creditDays, 10);
+    if (isNaN(gst) || gst < 0 || gst > 100) bad('GST % must be between 0 and 100');
+    if (isNaN(cd) || cd < 0 || cd > 365) bad('Default credit days must be 0–365');
+    return { id: 'main', cert: str(b.cert, 20, { req: 'NABL certificate number is required' }), gst: String(gst), creditDays: String(cd), machines: str(b.machines, 200) || 'CTM-01',
+      address: str(b.address, 300), phone: str(b.phone, 20), email: str(b.email, 120), footer: str(b.footer, 500) };
+  }
+  if (!isId(id)) bad('Invalid id');
+  if (coll === 'tests') {
+    const out = { id, name: str(b.name, 80, { req: 'Test name is required' }), code: str(b.code, 60), rate: String(money(b.rate, 'Rate')), nabl: !!b.nabl,
+      kind: old ? old.kind : 'simple', unit: str(b.unit || (old && old.unit) || 'sample', 20), ru: str(b.ru || (old && old.ru) || 'value', 30) };
+    if (old && old.fields) out.fields = old.fields; // paramset observation schema — not editable from the admin test-master form
+    return out;
+  }
+  if (coll === 'clients') {
+    const code = str(b.code, 20, { req: 'Client code is required' });
+    if (all('clients').some(c => c.id !== id && c.code.toLowerCase() === code.toLowerCase())) bad('Client code ' + code + ' is already used');
+    const gst = str(b.gst, 15); if (gst && gst.length !== 15) bad('GST number should be 15 characters');
+    const phone = str(b.phone, 10); if (phone && !/^\d{10}$/.test(phone)) bad('Phone should be 10 digits');
+    const terms = b.terms; if (terms !== 'Advance' && terms !== 'Credit') bad('Billing terms must be Advance or Credit');
+    const tests = all('tests'), rates = {};
+    Object.keys(b.rates || {}).forEach(k => { if (!tests.some(t => t.id === k)) return; const v = b.rates[k]; if (v === '' || v == null) rates[k] = ''; else rates[k] = String(money(v, 'Rate')); });
+    const cd = parseInt(b.creditDays, 10);
+    const cl = parseInt(b.creditLimit, 10);
+    const tdsP = L.num(b.tds);
+    return { id, code, name: str(b.name, 120, { req: 'Client name is required' }), address: str(b.address, 300), gst: gst.toUpperCase(), terms, creditDays: String(isNaN(cd) ? 0 : cd), contact: str(b.contact, 80), phone, rates,
+      gstRegistered: b.gstRegistered !== false, clientType: str(b.clientType, 40), pan: str(b.pan, 10).toUpperCase(), state: str(b.state, 40), billingAddress: str(b.billingAddress, 300),
+      accEmail: str(b.accEmail, 120), accMobile: str(b.accMobile, 10), invEmail: str(b.invEmail, 120), invWhatsapp: str(b.invWhatsapp, 10), repEmail: str(b.repEmail, 120), repWhatsapp: str(b.repWhatsapp, 10),
+      creditLimit: isNaN(cl) ? '' : String(cl), billingMode: str(b.billingMode, 40) || 'Per part, as each report is approved', tds: isNaN(tdsP) ? '0' : String(tdsP), poRequired: !!b.poRequired };
+  }
+  if (coll === 'workorders') {
+    if (!get('clients', b.clientId)) bad('Choose the client');
+    if (!L.isDate(b.date)) bad('Enter the work order date');
+    if (b.projectId) { const pr = get('projects', b.projectId); if (!pr || pr.clientId !== b.clientId) bad('Choose a project of this client'); }
+    const tests = all('tests'), rates = {};
+    Object.keys(b.rates || {}).forEach(k => { if (!tests.some(t => t.id === k)) return; const v = b.rates[k]; rates[k] = (v === '' || v == null) ? '' : String(money(v, 'Rate')); });
+    const no = str(b.no, 60, { req: 'Enter the work order number' });
+    return { id, clientId: b.clientId, projectId: b.projectId ? b.projectId : '', no, date: b.date, validTill: optDate(b.validTill, 'Valid till'), rates, notes: str(b.notes, 500), status: b.status === 'closed' ? 'closed' : 'active',
+      value: b.value === '' || b.value == null ? '' : String(money(b.value, 'Work order value')), alertThreshold: b.alertThreshold === false ? false : true, file: old ? old.file : undefined, fileName: old ? old.fileName : '', hasFile: !!(old && old.file) };
+  }
+  if (coll === 'vendorbills') {
+    const cats = ['calibration', 'subcontract', 'consumables', 'transport', 'equipment', 'rent', 'other'];
+    return { id, vendor: str(b.vendor, 80, { req: 'Enter the vendor name' }), desc: str(b.desc, 200), category: cats.includes(b.category) ? b.category : 'other', billNo: str(b.billNo, 40),
+      date: L.isDate(b.date) ? b.date : bad('Enter the vendor bill date'), due: optDate(b.due, 'Due date'), amount: (() => { const a = money(b.amount, 'Amount'); if (!(a > 0)) bad('Enter the bill amount'); return L.r2(a); })(), payments: old ? old.payments : [], createdOn: old ? old.createdOn : L.today() };
+  }
+  if (coll === 'quotes') {
+    const settings = get('settings', 'main') || {}, tests = all('tests');
+    const lines = (Array.isArray(b.lines) ? b.lines : []).slice(0, 40).map((l, i) => {
+      const qty = L.num(l.qty), rate = money(l.rate, 'Rate'); if (!(qty > 0)) bad('Line ' + (i + 1) + ': enter a quantity');
+      const t = tests.find(x => x.id === l.testId);
+      return { testId: t ? t.id : '', desc: str(l.desc || (t && t.name), 200, { req: 'Line ' + (i + 1) + ': add a description' }), qty, rate, amount: L.r2(qty * rate) };
+    });
+    if (!lines.length) bad('Add at least one test to the quotation');
+    const gp = L.num(b.gstPct), gstPct = isNaN(gp) ? (isNaN(L.num(settings.gst)) ? 18 : L.num(settings.gst)) : gp;
+    if (gstPct < 0 || gstPct > 100) bad('GST % must be between 0 and 100');
+    const client = b.clientId ? (get('clients', b.clientId) || bad('Unknown client')) : null, prospect = str(b.prospect, 120);
+    if (!client && !prospect) bad('Choose a client or enter the prospect name');
+    const sub = L.r2(lines.reduce((a, l) => a + l.amount, 0)), gst = L.r2(sub * gstPct / 100);
+    let no = old && old.no; if (!no) { const n = ctr('qt') + 1; ctrSet('qt', n); no = 'QT-' + L.today().slice(2, 4) + '-' + L.pad(n, 4); }
+    const status = ['draft', 'sent', 'accepted', 'rejected'].includes(b.status) ? b.status : 'draft';
+    return { id, no, clientId: client ? client.id : '', prospect: client ? '' : prospect, contact: str(b.contact, 80), phone: str(b.phone, 20), subject: str(b.subject, 160), date: L.isDate(b.date) ? b.date : L.today(), validTill: optDate(b.validTill, 'Valid till') || L.addDays(L.today(), 15),
+      lines, gstPct, subtotal: sub, gst, total: L.r2(sub + gst), terms: str(b.terms, 1200), notes: str(b.notes, 500), status, workorderId: old ? old.workorderId || '' : '', createdBy: old ? old.createdBy : actor.id };
+  }
+  if (coll === 'ratebook') {
+    if (old) bad('A rate book row is never changed — add a new one instead', 409);
+    if (!get('clients', b.clientId)) bad('Choose the client');
+    if (b.projectId) { const pr = get('projects', b.projectId); if (!pr || pr.clientId !== b.clientId) bad('Choose a project of this client'); }
+    if (!all('tests').some(t => t.id === b.testId)) bad('Choose a test');
+    if (!L.isDate(b.effectiveFrom)) bad('Enter the date this rate takes effect');
+    const rate = money(b.rate, 'Rate'); if (!(rate > 0)) bad('Enter the rate');
+    return { id, clientId: b.clientId, projectId: b.projectId || '', testId: b.testId, rate: String(L.r2(rate)), effectiveFrom: b.effectiveFrom, reason: str(b.reason, 200), createdBy: actor.id, createdOn: L.today() };
+  }
+  if (coll === 'projects') {
+    if (!get('clients', b.clientId)) bad('Unknown client');
+    if (old && actor.role === 'store') bad('Store users can add projects but not change them', 403);
+    return { id, clientId: b.clientId, name: str(b.name, 120, { req: 'Project name is required' }), site: str(b.site, 300) };
+  }
+  if (coll === 'leads') {
+    if (LEAD_STAGES.indexOf(b.stage) < 0) bad('Unknown lead stage');
+    return { id, name: str(b.name, 120, { req: 'Lead name is required' }), contact: str(b.contact, 80), phone: str(b.phone, 20), email: str(b.email, 120), source: str(b.source, 40),
+      stage: b.stage, value: money(b.value || 0, 'Value'), nextFollowUp: optDate(b.nextFollowUp, 'Follow-up date'), owner: optUser(b.owner, 'Owner'), notes: str(b.notes, 2000),
+      lostReason: b.stage === 'lost' ? str(b.lostReason, 120) : '', clientId: optClient(b.clientId), createdOn: optDate(b.createdOn, 'Created date') || L.today(), updatedOn: L.today() };
+  }
+  if (coll === 'interactions') {
+    if (INT_TYPES.indexOf(b.type) < 0) bad('Unknown interaction type');
+    if (!b.clientId && !b.leadId) bad('Pick a client or a lead');
+    if (b.leadId && !get('leads', b.leadId)) bad('Unknown lead');
+    if (!L.isDate(b.date)) bad('Date is not valid');
+    return { id, clientId: optClient(b.clientId), leadId: b.leadId || '', type: b.type, summary: str(b.summary, 1000, { req: 'Write a short summary' }), date: b.date, by: old ? old.by : actor.id };
+  }
+  if (coll === 'tasks') {
+    if (!L.isDate(b.due)) bad('Due date is not valid');
+    if (b.leadId && !get('leads', b.leadId)) bad('Unknown lead');
+    return { id, title: str(b.title, 200, { req: 'Task title is required' }), due: b.due, done: !!b.done, doneOn: b.done ? (optDate(b.doneOn, 'Done date') || L.today()) : '', assignee: optUser(b.assignee, 'Assignee'), clientId: optClient(b.clientId), leadId: b.leadId || '' };
+  }
+  bad('Unknown collection', 404);
+}
+function genericSave(u, coll, id, body) {
+  const g = GENERIC[coll]; if (!g) bad('Unknown collection', 404);
+  if (!g.roles.includes(u.role)) bad('Your role cannot change ' + coll, 403);
+  if (!body || typeof body !== 'object') bad('Expected a JSON object');
+  const key = coll === 'settings' ? 'main' : (id || body.id || (coll[0] + '_' + rid()));
+  const rec = clean(coll, Object.assign({}, body, { id: key }), get(coll, key), u);
+  return tx(() => put(coll, rec, u));
+}
+
+/* ---------------- location stamps ---------------- */
+/* The phone sends its GPS fix; the server adds its own clock, so the time cannot be edited on the device. */
+function geoOf(b, required) {
+  const g = b && b.geo;
+  if (!g || typeof g !== 'object') { if (required) bad('Location is required for this step. Turn on location and try again.', 400); return null; }
+  const lat = Number(g.lat), lng = Number(g.lng), acc = Number(g.acc);
+  if (!(Math.abs(lat) <= 90) || !(Math.abs(lng) <= 180) || (lat === 0 && lng === 0) || isNaN(lat) || isNaN(lng)) { if (required) bad('Location could not be read. Turn on location and try again.', 400); return null; }
+  return { lat: +lat.toFixed(6), lng: +lng.toFixed(6), acc: isNaN(acc) ? 0 : Math.min(99999, Math.round(acc)), at: new Date().toISOString() };
+}
+const geoTxt = g => g ? ' · at ' + g.lat + ',' + g.lng + (g.acc ? ' (±' + g.acc + ' m)' : '') : '';
+
+/* ---------------- notifications ---------------- */
+function putQuiet(coll, obj) {            /* system-written record: synced to devices, not listed in the audit log */
+  st('INSERT INTO records(org,coll,id,data,rev,deleted) VALUES(?,?,?,?,?,0) ON CONFLICT(org,coll,id) DO UPDATE SET data=excluded.data,rev=excluded.rev,deleted=0')
+    .run(ORG, coll, obj.id, JSON.stringify(obj), nextRev());
+}
+/* one notification per (id): calling again with the same id does nothing, so reminders are never repeated */
+function notify(userId, id, o) {
+  if (!userId || get('notifications', id)) return;
+  const { mail, ...rec } = o;
+  putQuiet('notifications', Object.assign({ id, userId, at: new Date().toISOString(), read: false }, rec));
+  dispatch(ORG, userId, Object.assign({ id }, rec), !!mail);
+}
+/* push and email go out after the request, never block it, and never fail it */
+const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://techassures-lab.onrender.com').replace(/\/$/, '');
+const vapid = () => { let v = metaGet('vapid'); if (!v) { v = JSON.stringify(N.newVapid()); metaSet('vapid', v); } return JSON.parse(v); };
+const subsGet = org => { try { return JSON.parse(metaGet('push:' + org) || '{}'); } catch (e) { return {}; } };
+const subsSet = (org, m) => metaSet('push:' + org, JSON.stringify(m));
+function dispatch(org, userId, n, mail) {
+  setImmediate(async () => {
+    try {
+      const u = withOrg(org, () => get('users', userId)); if (!u) return;
+      const link = PUBLIC_URL + '/?lab=' + encodeURIComponent(org);
+      if (mail && u.email) N.sendMail({ to: u.email, subject: n.title, text: n.body || '', link }).catch(e => console.error('mail', e.message));
+      const map = subsGet(org), list = map[userId] || []; if (!list.length) return;
+      const v = vapid(), keep = [];
+      for (const sub of list) {
+        let r = 'fail';
+        if (sub.fcm) { try { r = await N.sendFcm(sub.fcm, { title: n.title, body: n.body || '', url: link, tag: n.id || n.type }); } catch (e) { console.error('fcm', e.message); } if (r === 'off') r = 'fail'; if (r !== 'gone') keep.push(sub); continue; }
+        try { r = await N.sendPush(v, sub, { title: n.title, body: n.body || '', url: link, tag: n.id || n.type }); } catch (e) { console.error('push', e.message); }
+        if (r !== 'gone') keep.push(sub);
+      }
+      if (keep.length !== list.length) { const m2 = subsGet(org); m2[userId] = keep; subsSet(org, m2); }
+    } catch (e) { console.error('dispatch', e.message); }
+  });
+}
+const staffOf = roles => all('users').filter(x => x.active && roles.includes(x.role));
+function scanDue(now) {
+  now = now || new Date();
+  const hr = now.getHours(), today = L.today(), tomorrow = L.addDays(today, 1);
+  sysOrgs().filter(o => o.slug !== 'demo' || DEMO).forEach(org => withOrg(org.slug, () => {
+    const tests = all('tests');
+    tx(() => all('tickets').filter(t => ['open', 'in_progress', 'waiting'].includes(t.status) && t.due && t.due < today && hr >= 9).forEach(t => {
+      const to = t.assignee ? [t.assignee] : staffOf(['admin']).map(a => a.id);
+      to.forEach(uid => notify(uid, 'n_tk_' + t.id + '_od_' + today + '_' + uid, { type: 'ticket', title: 'Ticket overdue', body: t.no + ' · ' + t.title + ' (due ' + t.due + ')', ticketId: t.id }));
+    }));
+    tx(() => all('jobs').filter(j => j.status !== 'done').forEach(j => {
+      const smp = get('samples', j.sampleId); if (!smp) return;
+      const t = tests.find(x => x.id === smp.testId) || { name: 'Test', kind: 'simple' };
+      const what = smp.uid + ' · ' + jobLabel(t, j);
+      if (j.due === tomorrow && hr >= 16) notify(j.assignee, 'n_' + j.id + '_d1', { type: 'due', title: 'Test due tomorrow', body: what, sampleId: smp.id, jobId: j.id });
+      if (j.due === today && hr >= 7) notify(j.assignee, 'n_' + j.id + '_d0', { type: 'due', title: 'Test due today', body: what, sampleId: smp.id, jobId: j.id });
+      if (j.due < today && hr >= 9) {
+        const who = (all('users').find(x => x.id === j.assignee) || {}).name || 'unassigned';
+        notify(j.assignee, 'n_' + j.id + '_od_' + today, { type: 'overdue', title: 'Test overdue', body: what + ' was due ' + j.due, sampleId: smp.id, jobId: j.id });
+        staffOf(['admin']).forEach(a => { if (a.id !== j.assignee) notify(a.id, 'n_' + j.id + '_od_' + today + '_' + a.id, { type: 'overdue', title: 'Test overdue · ' + who, body: what + ' was due ' + j.due, sampleId: smp.id, jobId: j.id }); });
+      }
+    }));
+  }));
+  if (pg) pg.schedule();
+}
+
+/* ---------------- tickets ---------------- */
+const TK_STATUS = ['open', 'in_progress', 'waiting', 'resolved', 'closed'];
+const TK_PRI = ['low', 'normal', 'high', 'urgent'];
+const TK_CAT = ['equipment', 'sample', 'billing', 'client', 'app', 'other'];
+const TK_LABEL = { open: 'Open', in_progress: 'In progress', waiting: 'Waiting', resolved: 'Resolved', closed: 'Closed' };
+const tkDue = pri => L.addDays(L.today(), { urgent: 1, high: 2, normal: 5, low: 10 }[pri]);
+const tkNote = (ids, actor, t, title, body) => new Set(ids.filter(Boolean)).forEach(uid => { if (uid !== actor.id) notify(uid, 'n_tk_' + t.id + '_' + Date.now().toString(36) + '_' + uid, { type: 'ticket', title, body, ticketId: t.id }); });
+function ticketCreate(u, b) {
+  const title = str(b.title, 120, { req: 'Give the ticket a short title' });
+  const body = str(b.body, 3000, { req: 'Describe the problem or request' });
+  const category = TK_CAT.includes(b.category) ? b.category : 'other', priority = TK_PRI.includes(b.priority) ? b.priority : 'normal';
+  return tx(() => {
+    const n = ctr('tkt') + 1; ctrSet('tkt', n);
+    const t = { id: 'tk' + n, no: 'TKT-' + L.pad(n, 4), title, body, category, priority, status: 'open', raisedBy: u.id, raisedByName: u.name, createdAt: new Date().toISOString(), assignee: '', due: tkDue(priority), related: str(b.related, 60), comments: [], updatedAt: new Date().toISOString() };
+    put('tickets', t, u, 'create', t.no + ' · ' + title);
+    tkNote(staffOf(['admin']).map(a => a.id), u, t, 'New ticket ' + t.no, u.name + ': ' + title);
+    return { ticket: t };
+  });
+}
+function ticketAct(u, id, b) {
+  const t = get('tickets', id); if (!t || !(u.role === 'admin' || t.raisedBy === u.id || t.assignee === u.id)) bad('Ticket not found', 404);
+  const isAdmin = u.role === 'admin', isAsg = t.assignee === u.id, isRaiser = t.raisedBy === u.id;
+  const now = new Date().toISOString(), ev = [], oldStatus = t.status, oldAsg = t.assignee;
+  const text = str(b.text, 2000);
+  if (b.assignee !== undefined && b.assignee !== t.assignee) {
+    if (!isAdmin) bad('Only an admin can assign tickets', 403);
+    if (b.assignee) { const a = get('users', b.assignee); if (!a || !a.active) bad('Choose an active person'); ev.push('Assigned to ' + a.name); } else ev.push('Unassigned');
+    t.assignee = b.assignee;
+  }
+  if (b.priority !== undefined && b.priority !== t.priority) {
+    if (!isAdmin) bad('Only an admin can change priority', 403);
+    if (!TK_PRI.includes(b.priority)) bad('Unknown priority'); ev.push('Priority: ' + t.priority + ' → ' + b.priority); t.priority = b.priority; t.due = tkDue(b.priority);
+  }
+  if (b.status !== undefined && b.status !== t.status) {
+    if (!TK_STATUS.includes(b.status)) bad('Unknown status');
+    const raiserOk = isRaiser && (b.status === 'closed' || b.status === 'open');
+    if (!(isAdmin || (isAsg && b.status !== 'closed') || raiserOk)) bad('You cannot set this status', 403);
+    ev.push('Status: ' + TK_LABEL[t.status] + ' → ' + TK_LABEL[b.status]); t.status = b.status;
+    if (b.status === 'resolved' || b.status === 'closed') t.closedAt = now; else delete t.closedAt;
+  }
+  if (!text && !ev.length) bad('Nothing to update');
+  return tx(() => {
+    ev.forEach(e => t.comments.push({ id: rid(), kind: 'event', by: u.id, name: u.name, at: now, text: e }));
+    if (text) t.comments.push({ id: rid(), kind: 'comment', by: u.id, name: u.name, at: now, text });
+    t.updatedAt = now;
+    put('tickets', t, u, text ? 'comment' : 'update', t.no + (ev.length ? ' · ' + ev.join('; ') : '') + (text ? ' · comment' : ''));
+    if (t.assignee !== oldAsg && t.assignee) tkNote([t.assignee], u, t, 'Ticket assigned to you', t.no + ' · ' + t.title);
+    if (t.assignee !== oldAsg) tkNote([t.raisedBy], u, t, 'Your ticket was assigned', t.no + ' · ' + t.title);
+    if (t.status !== oldStatus) tkNote([t.raisedBy, t.assignee], u, t, 'Ticket ' + TK_LABEL[t.status].toLowerCase(), t.no + ' · ' + t.title);
+    if (text) tkNote([t.raisedBy, t.assignee].concat(staffOf(['admin']).map(a => a.id).filter(() => !t.assignee && !isAdmin)), u, t, 'New comment on ' + t.no, u.name + ': ' + text.slice(0, 90));
+    return { ticket: t };
+  });
+}
+
+/* ---------------- domain actions ---------------- */
+function createSample(u, b) {
+  const geo = geoOf(b, true);
+  const settings = get('settings', 'main'), tests = all('tests'), clients = all('clients');
+  const test = tests.find(t => t.id === b.testId); if (!test) bad('Choose a type of test');
+  const client = clients.find(c => c.id === b.clientId); if (!client) bad('Choose a client');
+  const proj = get('projects', b.projectId); if (!proj || proj.clientId !== client.id) bad('Choose a project of this client');
+  if (!L.isDate(b.receipt)) bad('Enter a valid date of receipt');
+  if (b.receipt > L.today()) bad('Date of receipt cannot be in the future');
+  if (b.sampledBy !== 'TechAssures' && b.sampledBy !== 'Client') bad('Sampled by must be TechAssures or Client');
+  if (b.billing !== 'Advance' && b.billing !== 'Credit') bad('Billing type must be Advance or Credit');
+  const mark = str(b.mark, 120, { req: 'Identification mark is required' });
+  if (b.cond !== 'Acceptable' && b.cond !== 'Not acceptable') bad('Choose the sample condition');
+  const reason = b.cond === 'Not acceptable' ? str(b.reason, 300, { req: 'Give a reason for rejecting the sample' }) : '';
+  const rep = b.rep || {};
+  const repName = str(rep.name, 80, { req: 'Enter the client representative name' });
+  if (!/^\d{10}$/.test(String(rep.mobile || ''))) bad('Representative mobile must be 10 digits');
+  const sig = String(rep.sig || ''); if (!/^data:image\/png;base64,/.test(sig) || sig.length > 300000) bad('A signature is required');
+  const photo = String(b.photo || ''); if (photo && (!/^data:image\/(jpeg|png);base64,/.test(photo) || photo.length > 2e6)) bad('Photo is not valid or too large');
+  const asg = get('users', b.assignee); if (!asg || asg.role !== 'tester' || !asg.active) bad('Choose an active tester');
+  if (Array.isArray(asg.authorisedTests) && asg.authorisedTests.length && !asg.authorisedTests.includes(test.id)) bad(asg.name + ' is not authorised for ' + test.name + ' (NABL competence)');
+  const dd = b.d || {}, d = {};
+  if (test.kind === 'cube') {
+    const ages = Array.isArray(dd.ages) ? dd.ages.map(Number).filter((a, i, arr) => [7, 14, 28].includes(a) && arr.indexOf(a) === i).sort((a, c) => a - c) : [];
+    if (!ages.length) bad('Select at least one test age');
+    if (!L.isDate(dd.casting) || dd.casting > L.today()) bad('Enter a valid date of casting (not in the future)');
+    const sizes = (Array.isArray(dd.sizes) ? dd.sizes : []).slice(0, 10).map(s => ({ l: L.num(s.l), b: L.num(s.b), h: L.num(s.h), n: parseInt(s.n, 10) }));
+    if (!sizes.length || sizes.some(s => !(s.l > 0 && s.b > 0 && s.h > 0 && s.n >= 1 && s.n <= 200))) bad('Check the cube sizes and counts');
+    const grade = str(dd.grade, 6); if (!/^M(10|15|20|25|30|35|40|45|50)$/.test(grade)) bad('Choose a grade between M10 and M50');
+    const source = dd.source; if (source !== 'RMC' && source !== 'Site mix') bad('Choose the concrete source');
+    const supplier = source === 'RMC' ? str(dd.supplier, 80, { req: 'Enter the RMC supplier' }) : '';
+    Object.assign(d, { grade, source, supplier, casting: dd.casting, ages, sizes, total: sizes.reduce((a, s) => a + s.n, 0) });
+  } else {
+    const qty = L.num(dd.qty); if (!(qty > 0) || qty > 100000) bad('Enter a quantity greater than 0');
+    if (!L.isDate(dd.due)) bad('Choose a due date');
+    Object.assign(d, { desc: str(dd.desc, 300, { req: 'Describe the sample' }), qty, due: dd.due });
+  }
+  const groupId = b.groupId ? String(b.groupId) : '';
+  if (groupId) {
+    const head = get('samples', groupId); if (!head) bad('The sample group to add this test to was not found');
+    if (head.clientId !== client.id || head.projectId !== proj.id) bad('Additional tests must use the same client and project as the original sample');
+  }
+  return tx(() => {
+    const n = ctr('uid'); ctrSet('uid', n + 1);
+    const yy = b.receipt.slice(2, 4);
+    const gid = groupId || ('s' + n);
+    const seq = all('samples').filter(x => x.groupId === gid).length;
+    const s = { id: 's' + n, uid: 'UID-' + yy + '-' + L.pad(n, 6), ulr: test.nabl ? settings.cert + '-' + yy + '-' + L.pad(n, 6) + '-F' : '', receipt: b.receipt, clientId: client.id, projectId: proj.id, sampledBy: b.sampledBy, billing: b.billing, testId: test.id, mark, d, photo, cond: b.cond, reason, rep: { name: repName, mobile: String(rep.mobile), sig }, assignee: asg.id, createdBy: u.id, reportStatus: 'testing', geo, groupId: gid, groupSeq: seq };
+    const jobs = test.kind === 'cube'
+      ? d.ages.map(a => ({ id: 'j' + n + '_' + a, sampleId: s.id, age: a, due: L.addDays(d.casting, a), assignee: asg.id, status: 'pending', results: null, remarks: '', ulr: s.ulr ? s.ulr + '-' + 'ABCDEFG'[d.ages.indexOf(a)] : '' }))
+      : [{ id: 'j' + n, sampleId: s.id, age: null, due: d.due, assignee: asg.id, status: 'pending', results: null, remarks: '', ulr: s.ulr }];
+    put('samples', s, u, 'create', 'Sample ' + s.uid + ' received for ' + client.name + geoTxt(geo));
+    jobs.forEach(j => put('jobs', j, u, 'create', jobLabel(test, j) + ' due ' + j.due));
+    notify(asg.id, 'n_assign_' + s.id, { type: 'assign', title: 'New test assigned to you', body: s.uid + ' · ' + (test.kind === 'cube' ? 'cubes, ' + d.ages.join('/') + '-day tests' : test.name) + ' · first due ' + jobs.map(j => j.due).sort()[0], sampleId: s.id, jobId: jobs[0].id });
+    return { sample: s, jobs };
+  });
+}
+const jobLabel = (t, j) => (t.kind === 'cube' ? j.age + '-day cube test' : t.name);
+
+const photoOk = p => { p = String(p || ''); if (p && (!/^data:image\/(jpeg|png);base64,/.test(p) || p.length > 700000)) bad('A cube photo is not valid or too large'); return p; };
+function saveResult(u, jobId, b) {
+  const geo = geoOf(b, true);
+  const job = get('jobs', jobId); if (!job) bad('Job not found', 404);
+  if (u.role !== 'admin' && !(u.role === 'tester' && job.assignee === u.id)) bad('This test is not assigned to you', 403);
+  const s = get('samples', job.sampleId), t = get('tests', s.testId);
+  const redo = job.status === 'done' && s.reportStatus === 'returned';
+  if (job.status === 'done' && !redo) bad('This result is already saved', 409);
+  if (job.due > L.today()) bad('Results can be saved only on or after ' + job.due, 409);
+  if (['awaiting', 'approved', 'sent'].includes(s.reportStatus) && job.status === 'done') bad('This report is already with the reviewer', 409);
+  let results, setup = null;
+  if (t.kind === 'cube') {
+    const rows = Array.isArray(b.rows) ? b.rows.slice(0, 200) : [];
+    if (!rows.length) bad('Enter the failing load for at least one cube');
+    const out = rows.map((r, i) => {
+      const l = L.num(r.l), bb = L.num(r.b), h = L.num(r.h), load = L.num(r.load), wt = L.num(r.weight);
+      if (!(load > 0 && load <= 10000)) bad('Cube ' + (i + 1) + ': enter the failing load in kN');
+      if (!s.d.sizes.some(z => z.l === l && z.b === bb && z.h === h)) bad('Cube ' + (i + 1) + ': size does not match the sample');
+      if (r.weight !== '' && r.weight != null && !(wt > 0 && wt < 100)) bad('Cube ' + (i + 1) + ': weight must be in kg');
+      return { l, b: bb, h, load, strength: L.strength(load, l, bb), weight: isNaN(wt) ? null : wt, photo: photoOk(r.photo) };
+    });
+    results = { rows: out, avg: L.r2(out.reduce((a, r) => a + r.strength, 0) / out.length) };
+    const su = b.setup || {}, temp = L.num(su.temp);
+    if (!str(su.machine, 40)) bad('Choose the testing machine');
+    if (!L.isDate(su.calDate) || su.calDate > L.today()) bad('Enter the machine calibration date (not in the future)');
+    if (isNaN(temp) || temp < 0 || temp > 60) bad('Enter the lab temperature in °C');
+    setup = { machine: str(su.machine, 40), calDate: su.calDate, temp };
+  } else if (t.kind === 'paramset') {
+    const single = t.fields.filter(f => !f.repeatable && f.type !== 'calculated');
+    const rep = t.fields.filter(f => f.repeatable && f.type !== 'calculated');
+    const values = {};
+    single.forEach(f => { const v = str((b.values || {})[f.key], 60); if (!v) bad('Enter ' + f.label.toLowerCase()); values[f.key] = v; });
+    const rowsIn = Array.isArray(b.rows) ? b.rows.slice(0, 200) : [];
+    const rows = rowsIn.map(r => { const o = {}; rep.forEach(f => o[f.key] = str(r[f.key], 60)); return o; });
+    results = { values, rows };
+  } else {
+    const v = str(b.value, 40, { req: 'Enter the result value' });
+    if (isNaN(L.num(v)) || L.num(v) < 0) bad('Result value must be a number');
+    results = { value: v };
+  }
+  return tx(() => {
+    job.results = results; if (setup) job.setup = setup; job.remarks = str(b.remarks, 500); job.status = 'done'; job.doneOn = L.today(); job.geo = geo; job.doneAt = geo.at; job.doneBy = u.id;
+    const logVal = results.avg != null ? ' · avg ' + results.avg + ' N/mm²' : (results.value != null ? ' · ' + results.value : ' · observations recorded');
+    put('jobs', job, u, 'result', s.uid + ' · ' + jobLabel(t, job) + logVal + (redo ? ' · corrected' : '') + geoTxt(geo));
+    if (all('jobs').filter(j => j.sampleId === s.id).every(j => j.status === 'done') && s.reportStatus === 'testing') { s.reportStatus = 'draft'; put('samples', s, u, 'status', s.uid + ' report drafted, ready to send for review'); }
+    const asg = assignedSet(u);
+    return { job, sample: shape(u, 'samples', s, asg) };
+  });
+}
+function submitReview(u, id, b) {
+  const s = get('samples', id); if (!s) bad('Sample not found', 404);
+  const jobs = all('jobs').filter(j => j.sampleId === s.id);
+  if (u.role !== 'admin' && !jobs.some(j => j.assignee === u.id)) bad('This report is not yours to send', 403);
+  if (!['draft', 'returned'].includes(s.reportStatus)) bad('This report cannot be sent for review right now', 409);
+  const rv = get('users', b.reviewer); if (!rv || !rv.active || !['reviewer', 'admin'].includes(rv.role)) bad('Choose a reviewer');
+  if (b.confirm !== true) bad('Confirm that you have checked the report');
+  const geo = geoOf(b, false), t = get('tests', s.testId), checks = L.reviewChecks(s, jobs, t);
+  return tx(() => {
+    const round = ((s.review && s.review.round) || 0) + 1;
+    s.review = { to: rv.id, toName: rv.name, by: u.id, byName: u.name, at: new Date().toISOString(), note: str(b.note, 400), email: !!b.email, whatsapp: !!b.whatsapp, checks, round, geo };
+    delete s.returnReason; s.reportStatus = 'awaiting';
+    put('samples', s, u, 'submit', s.uid + ' sent for review to ' + rv.name + (round > 1 ? ' (again)' : '') + geoTxt(geo));
+    notify(rv.id, 'n_rev_' + s.id + '_' + round, { type: 'awaiting', title: 'Report to review', body: s.uid + ' · from ' + u.name + (s.review.note ? ' · ' + s.review.note.slice(0, 60) : ''), sampleId: s.id, mail: !!b.email });
+    return { sample: s };
+  });
+}
+function returnReport(u, id, b) {
+  const s = get('samples', id); if (!s) bad('Sample not found', 404);
+  if (s.reportStatus !== 'awaiting') bad('Only a report under review can be returned', 409);
+  const reason = str(b.reason, 400, { req: 'Say what the tester should correct' }), geo = geoOf(b, false);
+  return tx(() => {
+    s.reportStatus = 'returned'; s.returnReason = reason; s.returnedBy = u.name; s.returnedAt = new Date().toISOString();
+    put('samples', s, u, 'return', s.uid + ' returned to tester: ' + reason + geoTxt(geo));
+    const n = (s.review && s.review.round) || 1;
+    new Set(all('jobs').filter(j => j.sampleId === s.id).map(j => j.assignee)).forEach(a => notify(a, 'n_ret_' + s.id + '_' + n, { type: 'returned', title: 'Report returned for correction', body: s.uid + ' · ' + reason.slice(0, 80), sampleId: s.id, mail: true }));
+    return { sample: s };
+  });
+}
+/* Invoice from the approved report, priced from the client's active work order (then client rate, then standard rate). */
+const invoicesOf = s => all('invoices').filter(i => i.sampleId === s.id);
+// Bills one completed, unbilled job (one part/age of a sample, or its only job). Safe to call more than once: a job already billed is skipped.
+function invoiceJob(u, job, sample) {
+  if (job.invoiced) return get('invoices', job.invoiceId);
+  if (job.status !== 'done') bad('Only a completed test can be invoiced', 409);
+  const s = sample || get('samples', job.sampleId); if (!s) bad('Sample not found', 404);
+  const settings = get('settings', 'main'), tests = all('tests'), clients = all('clients'), ctx = { settings, tests, clients, workorders: all('workorders'), ratebook: all('ratebook') }, today = L.today();
+  const n = ctr('inv'); ctrSet('inv', n + 1);
+  const inv = L.buildPartInvoice(ctx, s, job, n, today);
+  inv.issuedOn = today; inv.reportNo = s.reportNo || ''; inv.source = 'report';
+  job.invoiced = true; job.invoiceId = inv.id;
+  put('jobs', job, u, 'invoice', inv.no + ' created for ' + s.uid + (inv.partLabel ? ' part ' + inv.partLabel : '') + ' · total ₹' + inv.total + (inv.lines[0].woNo ? ' · work order ' + inv.lines[0].woNo : ''));
+  put('invoices', inv, u, 'invoice', inv.no + ' issued · total ₹' + inv.total);
+  if (inv.lines[0].woNo) woUsageAlert(u, s.clientId, inv.lines[0].woNo);
+  return inv;
+}
+// A standalone invoice not tied to a test result — e.g. a one-off consulting or documentation charge.
+function createManualInvoice(u, b) {
+  const client = get('clients', b.clientId); if (!client) bad('Choose a client');
+  const linesIn = Array.isArray(b.lines) ? b.lines.slice(0, 20) : [];
+  if (!linesIn.length) bad('Add at least one line item');
+  const lines = linesIn.map((l, i) => {
+    const desc = str(l.desc, 120); if (!desc) bad('Line ' + (i + 1) + ': enter a description');
+    const qty = L.num(l.qty); if (!(qty > 0)) bad('Line ' + (i + 1) + ': enter a quantity greater than 0');
+    const rate = L.num(l.rate); if (!(rate >= 0)) bad('Line ' + (i + 1) + ': enter a rate');
+    return { desc, qty, unit: 'unit', rate, amount: L.r2(qty * rate), rateSrc: 'manual' };
+  });
+  if (!L.isDate(b.date)) bad('Enter a valid invoice date');
+  const settings = get('settings', 'main');
+  const days = parseInt(client.creditDays, 10) || parseInt(settings.creditDays, 10) || 30;
+  const due = b.due && L.isDate(b.due) ? b.due : L.addDays(b.date, days);
+  const sub = L.r2(lines.reduce((a, l) => a + l.amount, 0));
+  const gp = L.num(settings.gst), gstPct = isNaN(gp) ? 18 : gp;
+  const gx = L.gstSplit(client, sub, gstPct);
+  return tx(() => {
+    const n = ctr('inv'); ctrSet('inv', n + 1);
+    const inv = {
+      id: 'im' + n, no: 'INV-' + b.date.slice(2, 4) + '-' + L.pad(n, 4), sampleId: null, clientId: client.id,
+      date: b.date, due, lines, subtotal: sub, gstPct, gst: gx.gst, gstType: gx.gstType, cgst: gx.cgst, sgst: gx.sgst, igst: gx.igst, sac: gx.sac, total: L.r2(sub + gx.gst),
+      source: 'manual', note: str(b.note, 300), createdBy: u.id
+    };
+    put('invoices', inv, u, 'invoice', inv.no + ' created for ' + client.name + ' (manual invoice) · total ₹' + inv.total);
+    return { invoice: inv };
+  });
+}
+function vendorPay(u, id, b) {
+  const v = get('vendorbills', id); if (!v) bad('Bill not found', 404);
+  const paid = L.r2((v.payments || []).reduce((a, p) => a + p.amount, 0)), bal = L.r2(v.amount - paid), amount = L.r2(L.num(b.amount));
+  if (!(amount > 0)) bad('Enter an amount greater than 0');
+  if (amount > bal + 0.004) bad('Amount is more than the balance of ₹' + bal);
+  if (!L.isDate(b.date) || b.date > L.today()) bad('Choose a valid payment date (not in the future)');
+  if (!['Cash', 'UPI', 'Bank transfer', 'Cheque'].includes(b.mode)) bad('Choose a payment mode');
+  return tx(() => { v.payments = (v.payments || []).concat([{ id: 'vp' + rid(), date: b.date, amount, mode: b.mode, ref: str(b.ref, 60), by: u.name }]); put('vendorbills', v, u, 'payment', v.vendor + ' · paid ₹' + amount + ' via ' + b.mode); return { bill: v }; });
+}
+// Work order rule: alert Accounts at 80% of WO value used, or within 30 days of expiry.
+// Each alert fires once per work order (alerted80 / alertedExpiry), not on every invoice/check.
+function woAlertRecipients(w) {
+  if (w.alertThreshold === false) return [];
+  return staffOf(['admin', 'accounts']);
+}
+function woUsageAlert(u, clientId, woNo) {
+  const w = all('workorders').find(x => x.clientId === clientId && x.no === woNo); if (!w || w.status === 'closed') return;
+  const value = L.num(w.value); if (!(value > 0) || w.alerted80) return;
+  const used = L.r2(all('invoices').filter(i => i.clientId === clientId && i.lines[0] && i.lines[0].woNo === woNo).reduce((a, i) => a + i.subtotal, 0));
+  if (used < value * 0.8) return;
+  const recips = woAlertRecipients(w); if (!recips.length) { w.alerted80 = true; put('workorders', w, u, 'update', 'Work order ' + w.no + ' 80% alert suppressed (alerts off)'); return; }
+  const c = get('clients', clientId) || {};
+  recips.forEach(a => notify(a.id, 'n_wo80_' + w.id, { type: 'wo_alert', title: 'Work order 80% used', body: w.no + ' · ' + (c.name || '') + ' · ₹' + used + ' of ₹' + value, mail: true }));
+  w.alerted80 = true;
+  put('workorders', w, u, 'update', 'Work order ' + w.no + ' reached 80% of its value (₹' + used + ' of ₹' + value + ') — Accounts notified');
+}
+// Sweeps all active work orders for the 30-days-to-expiry alert. Cheap (no I/O beyond what's
+// already cached per request) and safe to call on every bootstrap/snapshot — each WO only ever
+// fires this once thanks to alertedExpiry.
+function woExpiryCheck(u) {
+  const today = L.today();
+  all('workorders').filter(w => w.status !== 'closed' && w.validTill && !w.alertedExpiry && w.alertThreshold !== false && w.validTill >= today && w.validTill <= L.addDays(today, 30)).forEach(w => {
+    const c = get('clients', w.clientId) || {};
+    woAlertRecipients(w).forEach(a => notify(a.id, 'n_woexp_' + w.id, { type: 'wo_alert', title: 'Work order expiring soon', body: w.no + ' · ' + (c.name || '') + ' · valid till ' + w.validTill, mail: true }));
+    w.alertedExpiry = true;
+    put('workorders', w, u, 'update', 'Work order ' + w.no + ' expires within 30 days (' + w.validTill + ') — Accounts notified');
+  });
+}
+function woFile(u, id, b) {
+  const w = get('workorders', id); if (!w) bad('Work order not found', 404);
+  const data = String(b.data || ''); if (!/^data:(application\/pdf|image\/jpeg|image\/png);base64,/.test(data) || data.length > 2.4e6) bad('Upload a PDF, JPG or PNG under 1.7 MB');
+  w.file = data; w.fileName = str(b.name, 100) || 'work-order'; w.hasFile = true;
+  return tx(() => { put('workorders', w, u, 'upload', 'Work order ' + w.no + ' file uploaded: ' + w.fileName); const o = Object.assign({}, w); delete o.file; return { workorder: o }; });
+}
+function approveReport(u, id, b) {
+  const geo = geoOf(b, false);
+  const s = get('samples', id); if (!s) bad('Sample not found', 404);
+  if (s.reportStatus !== 'awaiting') bad('Only a report that is awaiting approval can be approved', 409);
+  if (s.review && s.review.to && u.role === 'reviewer' && s.review.to !== u.id) bad('This report was sent to ' + s.review.toName, 403);
+  if (u.role === 'reviewer' && !isSignatory(u)) bad('You are not an authorised signatory for final reports — ask an admin to sign this one', 403);
+  if (s.review && b.confirm !== true) bad('Tick the box to sign the report');
+  return tx(() => {
+    const now = new Date().toISOString(), num = parseInt(s.uid.slice(-6), 10);
+    s.reportStatus = 'approved'; s.approvedBy = u.name; s.approvedById = u.id; s.approvedOn = L.today(); s.approvedAt = now; s.approveGeo = geo;
+    s.reportNo = 'TA/CT/' + s.uid.slice(4, 6) + '/' + L.pad(num, 4); s.reviewRemark = str(b.remark, 300); delete s.returnReason;
+    const jobs = all('jobs').filter(j => j.sampleId === s.id), testers = [...new Set(jobs.map(j => j.assignee))].map(x => get('users', x)).filter(Boolean);
+    const cl = get('clients', s.clientId) || {}, pj = get('projects', s.projectId) || {}, notes = [];
+    testers.forEach(tu => { notify(tu.id, 'n_ok_' + s.id + '_' + tu.id, { type: 'approved', title: 'Report approved', body: s.reportNo + ' approved by ' + u.name, sampleId: s.id, mail: true }); notes.push({ who: 'Tester: ' + tu.name, text: 'Report ' + s.reportNo + ' approved. Test moved to Approved.', how: 'In-app', at: now }); });
+    const acc = staffOf(['accounts', 'admin']).filter(x => x.id !== u.id); acc.forEach(a => notify(a.id, 'n_okacc_' + s.id + '_' + a.id, { type: 'approved', title: 'Report approved, ready to send', body: s.reportNo + ' · ' + (cl.name || '') + (pj.name ? ' · ' + pj.name : ''), sampleId: s.id, mail: true }));
+    if (acc.length) notes.push({ who: 'Accounts department', text: 'Report ' + s.reportNo + ' is ready to send (' + (cl.name || '') + (pj.name ? ', ' + pj.name : '') + ').', how: 'In-app', at: now });
+    const billed = jobs.filter(j => j.status === 'done' && !j.invoiced).map(j => invoiceJob(u, j, s));
+    billed.forEach(inv => { if (acc.length) notes.push({ who: 'Accounts department', text: 'Invoice ' + inv.no + ' created from the report: ₹' + inv.total + (inv.lines[0].woNo ? ' at work order ' + inv.lines[0].woNo + ' rates' : '') + '.', how: 'In-app', at: now }); });
+    s.approvalNotes = notes;
+    put('samples', s, u, 'approve', s.uid + ' report approved and signed' + geoTxt(geo));
+    return s;
+  });
+}
+function sendReport(u, id, b) {
+  const geo = geoOf(b, false);
+  const s = get('samples', id); if (!s) bad('Sample not found', 404);
+  if (s.reportStatus !== 'approved') bad('Approve the report before sending it', 409);
+  const unpaid = invoicesOf(s).find(i => balanceOf(i) > 0.004);
+  if (s.billing === 'Advance' && unpaid) bad('Blocked: this is an Advance client and bill ' + unpaid.no + ' is unpaid', 409);
+  s.reportStatus = 'sent'; s.sentOn = L.today(); s.sendGeo = geo;
+  return tx(() => put('samples', s, u, 'send', s.uid + ' marked as sent' + geoTxt(geo)));
+}
+// A cheque payment is only real money once it clears: it starts "Deposited" (invoice stays due) and
+// either becomes "Cleared" (counts as paid) or "Bounced" (never did, invoice reopens). Cash/UPI/bank
+// transfer/NEFT are credited immediately. Older payments saved before this status existed have no
+// field at all, so an absent status is treated as Credited (unchanged behaviour for them).
+const payCounts = p => p.status !== 'Deposited' && p.status !== 'Bounced';
+const paidOf = inv => L.r2(all('payments').filter(p => p.invoiceId === inv.id && payCounts(p)).reduce((a, p) => a + (+p.amount), 0));
+const balanceOf = inv => L.r2(inv.total - paidOf(inv));
+function recordPayment(u, invId, b) {
+  const inv = get('invoices', invId); if (!inv) bad('Invoice not found', 404);
+  const amount = L.r2(L.num(b.amount));
+  if (!(amount > 0)) bad('Enter an amount greater than 0');
+  const bal = balanceOf(inv);
+  if (amount > bal + 0.004) bad('Amount is more than the balance of ₹' + bal);
+  if (!L.isDate(b.date) || b.date > L.today()) bad('Choose a valid payment date (not in the future)');
+  if (!['Cash', 'UPI', 'Bank transfer', 'Cheque'].includes(b.mode)) bad('Choose a payment mode');
+  const geo = geoOf(b, false);
+  const status = b.mode === 'Cheque' ? 'Deposited' : 'Credited';
+  const bankName = b.mode === 'Cheque' ? str(b.bankName, 80) : '';
+  const branch = b.mode === 'Cheque' ? str(b.branch, 80) : '';
+  const p = { id: 'pay' + rid(), invoiceId: inv.id, amount, date: b.date, mode: b.mode, ref: str(b.ref, 60), status, geo, at: new Date().toISOString(), bankName, branch };
+  return tx(() => { put('payments', p, u, 'payment', inv.no + ' · ₹' + amount + ' via ' + p.mode + (status === 'Deposited' ? ' (cheque deposited, pending clearance' + (bankName ? ', ' + bankName : '') + ')' : '') + geoTxt(geo)); return { payment: p }; });
+}
+function chequeTransition(u, id, to) {
+  const p = get('payments', id); if (!p) bad('Payment not found', 404);
+  if (p.mode !== 'Cheque') bad('Only a cheque payment has a clearance status', 409);
+  if (p.status !== 'Deposited') bad('This cheque is already ' + (p.status || 'Credited'), 409);
+  const inv = get('invoices', p.invoiceId);
+  return tx(() => {
+    p.status = to;
+    put('payments', p, u, 'payment', (inv ? inv.no : p.invoiceId) + ' · cheque ' + p.ref + ' marked ' + to.toLowerCase() + ' (₹' + p.amount + ')');
+    return { payment: p };
+  });
+}
+/* One payment can be split across several of a client's bills: applied oldest-first, TDS counted as settled without being cash received. */
+function applyClientPayment(u, clientId, b) {
+  const client = get('clients', clientId); if (!client) bad('Client not found', 404);
+  const ids = Array.isArray(b.invoiceIds) ? b.invoiceIds : [];
+  if (!ids.length) bad('Choose at least one invoice');
+  const invs = ids.map(x => { const i = get('invoices', x); if (!i || i.clientId !== clientId) bad('Invoice not found'); return i; });
+  const cash = L.r2(L.num(b.amount)), tds = L.r2(L.num(b.tds) || 0);
+  if (!(cash > 0)) bad('Enter an amount greater than 0');
+  if (!L.isDate(b.date) || b.date > L.today()) bad('Choose a valid payment date (not in the future)');
+  if (!['Cash', 'UPI', 'Bank transfer', 'Cheque', 'NEFT'].includes(b.mode)) bad('Choose a payment mode');
+  const totalBal = L.r2(invs.reduce((a, i) => a + balanceOf(i), 0));
+  let remaining = L.r2(cash + tds);
+  if (remaining > totalBal + 0.004) bad('Amount is more than the total balance of the selected invoices (₹' + totalBal + ')');
+  const geo = geoOf(b, false), groupId = 'pg' + rid(), at = new Date().toISOString(), created = [];
+  const status = b.mode === 'Cheque' ? 'Deposited' : 'Credited';
+  return tx(() => {
+    let tdsLeft = tds;
+    invs.forEach(inv => {
+      if (remaining <= 0.004) return;
+      const bal = balanceOf(inv), applied = Math.min(bal, remaining);
+      const tdsHere = Math.min(tdsLeft, applied); tdsLeft = L.r2(tdsLeft - tdsHere);
+      const cashHere = L.r2(applied - tdsHere);
+      const p = { id: 'pay' + rid(), invoiceId: inv.id, amount: applied, cash: cashHere, tds: tdsHere, date: b.date, mode: b.mode, ref: str(b.ref, 60), depositTo: str(b.depositTo, 80), remarks: str(b.remarks, 300), status, groupId, geo, at };
+      put('payments', p, u, 'payment', inv.no + ' · ₹' + applied + ' via ' + p.mode + (tdsHere ? ' (incl. ₹' + tdsHere + ' TDS)' : '') + (status === 'Deposited' ? ' (cheque deposited, pending clearance)' : '') + geoTxt(geo));
+      created.push(p);
+      remaining = L.r2(remaining - applied);
+    });
+    return { payments: created };
+  });
+}
+function adminUsers(u, method, id, b) {
+  if (method === 'POST') {
+    const email = str(b.email, 120).toLowerCase();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) bad('Enter a valid email address');
+    if (email && all('users').some(x => (x.email || '') === email)) bad('This email is already added');
+    let login = str(b.login, 20).toLowerCase(), c = { salt: '', hash: '' };
+    if (login || b.pin) {
+      if (!/^[a-z0-9._-]{3,20}$/.test(login)) bad('Login name: 3–20 letters, digits, dot, dash or underscore');
+      if (all('users').some(x => x.login === login)) bad('This login name is taken');
+      if (!/^\d{4,8}$/.test(String(b.pin || ''))) bad('PIN must be 4 to 8 digits');
+      c = newCred(b.pin);
+    } else if (!email) bad('Give a login name and PIN, or an email for Google sign-in');
+    if (!ROLES.includes(b.role)) bad('Choose a role');
+    const allTestIds = all('tests').map(x => x.id);
+    const authorisedTests = Array.isArray(b.authorisedTests) ? b.authorisedTests.filter(x => allTestIds.includes(x)) : [];
+    const rec = { id: 'u_' + rid(), login, email, name: str(b.name, 60, { req: 'Enter the full name' }), role: b.role, active: true, salt: c.salt, hash: c.hash, authorisedTests, signatory: b.role === 'reviewer' ? b.signatory !== false : false };
+    return tx(() => { put('users', rec, u, 'create', 'User ' + (login || email) + ' (' + rec.role + ') added'); return pubUser(rec, true); });
+  }
+  const cur = get('users', id); if (!cur) bad('User not found', 404);
+  const next = Object.assign({}, cur);
+  if (b.name != null) next.name = str(b.name, 60, { req: 'Enter the full name' });
+  if (b.role != null) { if (!ROLES.includes(b.role)) bad('Choose a role'); next.role = b.role; }
+  if (b.active != null) next.active = !!b.active;
+  if (b.email != null) { const em = str(b.email, 120).toLowerCase(); if (em && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) bad('Enter a valid email address'); if (em && all('users').some(x => x.id !== id && (x.email || '') === em)) bad('This email is already added'); next.email = em; }
+  if (b.pin != null && b.pin !== '') { if (!/^\d{4,8}$/.test(String(b.pin))) bad('PIN must be 4 to 8 digits'); Object.assign(next, newCred(b.pin)); }
+  if (b.authorisedTests != null) { const allTestIds = all('tests').map(x => x.id); next.authorisedTests = Array.isArray(b.authorisedTests) ? b.authorisedTests.filter(x => allTestIds.includes(x)) : []; }
+  if (b.signatory != null) next.signatory = !!b.signatory;
+  if (id === u.id && (!next.active || next.role !== 'admin')) bad('You cannot disable or demote your own account');
+  const others = all('users').filter(x => x.id !== id && x.active && x.role === 'admin').length;
+  if (cur.role === 'admin' && (!next.active || next.role !== 'admin') && others === 0) bad('Keep at least one active admin');
+  return tx(() => {
+    put('users', next, u, 'update', (b.pin ? 'PIN reset; ' : '') + diffSummary(Object.assign({}, cur, { salt: 0, hash: 0 }), Object.assign({}, next, { salt: 0, hash: 0 })));
+    if (!next.active) st('DELETE FROM sessions WHERE org=? AND user_id=?').run(ORG, id);
+    return pubUser(next, true);
+  });
+}
+function resetDemo(u, b) {
+  if (ORG !== 'demo') bad('Only the demo lab can be reset', 403);
+  if (b.confirm !== 'RESET') bad('Send {"confirm":"RESET"} to reset');
+  return tx(() => {
+    st('UPDATE records SET deleted=1,rev=? WHERE org=?').run(nextRev(), ORG);
+    seedDb(); audit(u, 'reset', null, null, 'Demo data restored');
+    return { ok: true };
+  });
+}
+
+/* ---------------- csv export ---------------- */
+const CSV_ROLES = { admin: COLLS.concat(['settings']), accounts: ['clients', 'projects', 'samples', 'jobs', 'invoices', 'payments', 'leads', 'interactions', 'tasks'] };
+function csvCell(v) {
+  if (v == null) return '';
+  let s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;           // block spreadsheet formula injection
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function toCsv(coll) {
+  const rows = all(coll).map(r => { const o = Object.assign({}, r); delete o.photo; delete o.salt; delete o.hash; if (o.rep) o.rep = { name: o.rep.name, mobile: o.rep.mobile }; return o; });
+  const cols = []; rows.forEach(r => Object.keys(r).forEach(k => { if (cols.indexOf(k) < 0) cols.push(k); }));
+  return [cols.join(',')].concat(rows.map(r => cols.map(c => csvCell(r[c])).join(','))).join('\n');
+}
+
+/* ---------------- router ---------------- */
+const routes = [];
+const route = (method, re, roles, fn) => routes.push({ method, re, roles, fn });
+const ok = (res, code, obj) => { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(b); };
+
+route('GET', /^\/api\/health$/, null, c => {
+  const out = { ok: true, demo: DEMO, googleClientId: GOOGLE_CLIENT_ID };
+  if (DEMO) out.demoAccounts = withOrg('demo', () => all('users')).filter(x => x.active && DEMO_PINS[x.login] && pinOk(x, DEMO_PINS[x.login])).map(x => ({ login: x.login, pin: DEMO_PINS[x.login], role: x.role }));
+  return out;
+});
+route('GET', /^\/api\/push\/key$/, '*', c => ({ key: vapid().pub, mail: N.mailOn() }));
+route('POST', /^\/api\/push\/subscribe$/, '*', c => {
+  const sub = c.body.sub;
+  if (sub && sub.fcm) {
+    const map = subsGet(c.u.org), list = (map[c.u.id] || []).filter(x => x.fcm !== sub.fcm); list.push({ fcm: String(sub.fcm).slice(0, 400) });
+    map[c.u.id] = list.slice(-5); subsSet(c.u.org, map); return { ok: true };
+  }
+  if (!sub || !/^https:\/\//.test(String(sub.endpoint || '')) || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) bad('Not a valid push subscription');
+  const map = subsGet(c.u.org), list = (map[c.u.id] || []).filter(x => x.endpoint !== sub.endpoint);
+  list.push({ endpoint: String(sub.endpoint), keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) } });
+  map[c.u.id] = list.slice(-5); subsSet(c.u.org, map); return { ok: true };
+});
+route('POST', /^\/api\/push\/unsubscribe$/, '*', c => {
+  const map = subsGet(c.u.org); map[c.u.id] = (map[c.u.id] || []).filter(x => x.endpoint !== String(c.body.endpoint || '') && x.fcm !== String(c.body.fcm || '\0')); subsSet(c.u.org, map); return { ok: true };
+});
+route('POST', /^\/api\/login$/, null, c => {
+  const lab = String(c.body.lab || 'demo').trim().toLowerCase(), login = String(c.body.login || '').trim().toLowerCase(), key = c.ip + '|' + lab + '|' + login;
+  throttle(key);
+  const org = findOrg(lab);
+  if (!org || (lab === 'demo' && !DEMO)) { failed(key); bad('Wrong lab code, login name or PIN', 401); }
+  if (org.suspended) bad('This lab is suspended. Please contact TechAssures support.', 403);
+  return withOrg(org.slug, () => {
+    const u = login ? all('users').find(x => x.login === login) : null;
+    if (!u || !pinOk(u, c.body.pin)) { failed(key); audit({ id: '', name: login || '(blank)' }, 'login_failed', 'users', u ? u.id : '', 'Wrong PIN · ' + whereOf(c.req, c.ip)); bad('Wrong lab code, login name or PIN', 401); }
+    if (!u.active) bad('This account is disabled. Ask the admin.', 403);
+    attempts.delete(key);
+    audit(u, 'login', 'users', u.id, 'PIN · ' + whereOf(c.req, c.ip));
+    return { token: newSession(u.id), user: pubUser(u, true) };
+  });
+});
+route('POST', /^\/api\/logout$/, '*', c => { const m = /^Bearer ([a-f0-9]{64})$/.exec(c.req.headers.authorization || ''); if (m) st('DELETE FROM sessions WHERE token_hash=?').run(sha(m[1])); return { ok: true }; });
+
+/* ---------------- self-service PIN reset (email only — no SMS gateway is set up) ---------------- */
+route('POST', /^\/api\/forgot-pin$/, null, c => {
+  const lab = String(c.body.lab || 'demo').trim().toLowerCase(), id = String(c.body.identifier || '').trim().toLowerCase();
+  const key = c.ip + '|forgot|' + lab; throttle(key);
+  const org = findOrg(lab);
+  const generic = { ok: true, message: 'If that account exists and has an email on file, a reset link has been sent.' };
+  if (!org || (lab === 'demo' && !DEMO) || !id) return generic;
+  withOrg(org.slug, () => {
+    const u = all('users').find(x => x.active && ((x.login || '').toLowerCase() === id || (x.email || '').toLowerCase() === id));
+    if (!u || !u.email || !u.salt) return; // no match, or a Google-only account with no PIN to reset
+    const token = crypto.randomBytes(24).toString('hex');
+    putQuiet('pinresets', { id: token, userId: u.id, exp: Date.now() + 30 * 60 * 1000, used: false });
+    const link = PUBLIC_URL + '/?lab=' + encodeURIComponent(org.slug) + '&resetpin=' + token;
+    N.sendMail({ to: u.email, subject: 'Reset your TechAssures Lab PIN', text: 'Tap the link below to set a new PIN for your account (' + u.name + '). This link expires in 30 minutes. If you did not request this, ignore this email.', link }).catch(e => console.error('mail', e.message));
+    audit(u, 'pin_reset_requested', 'users', u.id, 'PIN reset email sent · ' + whereOf(c.req, c.ip));
+  });
+  return generic;
+});
+route('POST', /^\/api\/reset-pin$/, null, c => {
+  const lab = String(c.body.lab || 'demo').trim().toLowerCase(), token = String(c.body.token || '').trim(), pin = String(c.body.pin || '');
+  const org = findOrg(lab); if (!org) bad('Reset link is invalid or has expired', 400);
+  if (!/^\d{4}$/.test(pin)) bad('PIN must be 4 digits');
+  return withOrg(org.slug, () => {
+    const r = get('pinresets', token);
+    if (!r || r.used || r.exp < Date.now()) bad('This reset link is invalid or has expired. Request a new one.', 400);
+    const u = get('users', r.userId); if (!u || !u.active) bad('This reset link is invalid or has expired. Request a new one.', 400);
+    const c2 = newCred(pin);
+    u.salt = c2.salt; u.hash = c2.hash;
+    r.used = true;
+    put('pinresets', r, null, 'update', 'Reset link used');
+    put('users', u, u, 'pin_reset', u.name + ' set a new PIN via self-service reset');
+    return { token: newSession(u.id), user: pubUser(u, true) };
+  });
+});
+
+/* ---------------- Google sign-in and lab sign-up ---------------- */
+const google = { jwks: null, at: 0 };
+async function googleKeys() {
+  if (google.jwks && Date.now() - google.at < 36e5) return google.jwks;
+  const r = await fetch('https://www.googleapis.com/oauth2/v3/certs');
+  if (!r.ok) throw new ApiError(502, 'Could not reach Google. Try again.');
+  google.jwks = (await r.json()).keys; google.at = Date.now(); return google.jwks;
+}
+const b64u = b => Buffer.from(b, 'base64url');
+async function verifyGoogle(credential) {
+  if (!GOOGLE_CLIENT_ID) bad('Google sign-in is not set up on this server', 501);
+  const parts = String(credential || '').split('.'); if (parts.length !== 3) bad('Google sign-in failed', 401);
+  let head, pay;
+  try { head = JSON.parse(b64u(parts[0]).toString()); pay = JSON.parse(b64u(parts[1]).toString()); } catch (e) { bad('Google sign-in failed', 401); }
+  if (head.alg !== 'RS256') bad('Google sign-in failed', 401);
+  const key = (await googleKeys()).find(k => k.kid === head.kid); if (!key) bad('Google sign-in failed', 401);
+  const good = crypto.verify('RSA-SHA256', Buffer.from(parts[0] + '.' + parts[1]), crypto.createPublicKey({ key, format: 'jwk' }), b64u(parts[2]));
+  if (!good) bad('Google sign-in failed', 401);
+  if (!['accounts.google.com', 'https://accounts.google.com'].includes(pay.iss) || pay.aud !== GOOGLE_CLIENT_ID || !(pay.exp * 1000 > Date.now())) bad('Google sign-in expired. Try again.', 401);
+  if (!pay.email || pay.email_verified !== true) bad('Your Google email is not verified', 401);
+  return { email: String(pay.email).toLowerCase(), name: String(pay.name || pay.email.split('@')[0]).slice(0, 60) };
+}
+const sign = o => { const p = Buffer.from(JSON.stringify(o)).toString('base64url'); return p + '.' + crypto.createHmac('sha256', APP_SECRET).update(p).digest('base64url'); };
+function unsign(t) {
+  const [p, m] = String(t || '').split('.'); if (!p || !m) return null;
+  const want = crypto.createHmac('sha256', APP_SECRET).update(p).digest('base64url');
+  if (m.length !== want.length || !crypto.timingSafeEqual(Buffer.from(m), Buffer.from(want))) return null;
+  try { const o = JSON.parse(Buffer.from(p, 'base64url').toString()); return o.exp > Date.now() ? o : null; } catch (e) { return null; }
+}
+route('POST', /^\/api\/google$/, null, async c => {
+  const g = await (c.verify || verifyGoogle)(c.body.credential);
+  const want = String(c.body.lab || '').trim().toLowerCase();
+  const found = sysOrgs().filter(o => !o.suspended && (o.slug !== 'demo' || DEMO) && (!want || o.slug === want)).map(o => ({ o, u: withOrg(o.slug, () => all('users')).find(x => (x.email || '') === g.email && x.active) })).filter(x => x.u);
+  if (found.length === 1) {
+    const { o, u } = found[0];
+    return withOrg(o.slug, () => { audit(u, 'login', 'users', u.id, 'Google · ' + whereOf(c.req, c.ip)); return { token: newSession(u.id), user: pubUser(u, true) }; });
+  }
+  if (found.length > 1) return { choose: found.map(x => ({ slug: x.o.slug, name: x.o.name })) };
+  if (want) bad('This Google account is not a member of that lab', 403);
+  return { signup: { token: sign({ email: g.email, name: g.name, exp: Date.now() + 15 * 60e3 }), email: g.email, name: g.name } };
+});
+const signups = new Map();
+route('POST', /^\/api\/signup$/, null, c => {
+  const t = unsign(c.body.token); if (!t) bad('Sign-up expired. Sign in with Google again.', 401);
+  const hr = signups.get(c.ip) || []; const recent = hr.filter(x => x > Date.now() - 36e5);
+  if (recent.length >= 5) bad('Too many labs created from this network. Try later.', 429);
+  const name = str(c.body.labName, 80, { req: 'Enter your lab name' });
+  let slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'lab';
+  const taken = new Set(sysOrgs().map(o => o.slug)); taken.add('demo'); taken.add('_sys');
+  if (taken.has(slug)) slug = slug.slice(0, 18) + '-' + rid().slice(0, 4);
+  const org = { id: slug, slug, name, plan: 'trial', createdOn: L.today(), ownerEmail: t.email };
+  recent.push(Date.now()); signups.set(c.ip, recent);
+  return tx(() => {
+    putOrg(org);
+    return withOrg(slug, () => {
+      const admin = { id: 'u_' + rid(), login: '', email: t.email, name: t.name, role: 'admin', active: true, salt: '', hash: '' };
+      seedBlank(admin);
+      audit(admin, 'signup', 'orgs', slug, 'Lab ' + name + ' created · ' + whereOf(c.req, c.ip));
+      return { token: newSession(admin.id), user: pubUser(admin, true), lab: slug };
+    });
+  });
+});
+
+route('GET', /^\/api\/bootstrap$/, '*', c => { if (['admin', 'accounts'].includes(c.u.role)) woExpiryCheck(c.u); return Object.assign({ user: pubUser(c.u, true) }, snapshot(c.u)); });
+route('GET', /^\/api\/changes$/, '*', c => changes(c.u, parseInt(c.url.searchParams.get('since'), 10) || 0));
+route('POST', /^\/api\/samples$/, ['admin', 'store'], c => createSample(c.u, c.body));
+route('POST', /^\/api\/jobs\/([\w-]+)\/result$/, ['admin', 'tester'], c => saveResult(c.u, c.m[1], c.body));
+route('POST', /^\/api\/samples\/([\w-]+)\/submit$/, ['admin', 'tester'], c => submitReview(c.u, c.m[1], c.body));
+route('POST', /^\/api\/samples\/([\w-]+)\/return$/, ['admin', 'reviewer', 'accounts'], c => returnReport(c.u, c.m[1], c.body));
+route('POST', /^\/api\/samples\/([\w-]+)\/approve$/, ['admin', 'accounts', 'reviewer'], c => ({ sample: approveReport(c.u, c.m[1], c.body) }));
+route('GET', /^\/api\/jobs\/to-invoice$/, ['admin', 'accounts'], c => {
+  const rows = all('jobs').filter(j => j.status === 'done' && !j.invoiced).map(j => {
+    const sa = get('samples', j.sampleId), t = get('tests', sa.testId);
+    return { job: j, sample: shape(c.u, 'samples', sa, new Set()), test: { id: t.id, name: t.name, code: t.code, kind: t.kind }, client: (get('clients', sa.clientId) || {}).name || '', partLabel: L.partLabel(sa, j) };
+  }).sort((a, b) => a.job.doneOn < b.job.doneOn ? 1 : -1);
+  return { rows };
+});
+route('POST', /^\/api\/jobs\/([\w-]+)\/invoice$/, ['admin', 'accounts'], c => { const j = get('jobs', c.m[1]); if (!j) bad('Test not found', 404); return tx(() => { const inv = invoiceJob(c.u, j); return { invoice: inv, job: j }; }); });
+route('POST', /^\/api\/vendorbills\/([\w-]+)\/pay$/, ['admin', 'accounts'], c => vendorPay(c.u, c.m[1], c.body));
+route('POST', /^\/api\/workorders\/([\w-]+)\/file$/, ['admin', 'accounts'], c => woFile(c.u, c.m[1], c.body));
+route('GET', /^\/api\/workorders\/([\w-]+)\/file$/, ['admin', 'accounts'], c => { const w = get('workorders', c.m[1]); if (!w || !w.file) bad('No file uploaded', 404); return { name: w.fileName, data: w.file }; });
+route('POST', /^\/api\/samples\/([\w-]+)\/send$/, ['admin', 'accounts'], c => ({ sample: sendReport(c.u, c.m[1], c.body) }));
+route('POST', /^\/api\/invoices\/manual$/, ['admin', 'accounts'], c => createManualInvoice(c.u, c.body));
+route('POST', /^\/api\/invoices\/([\w-]+)\/payments$/, ['admin', 'accounts'], c => recordPayment(c.u, c.m[1], c.body));
+route('POST', /^\/api\/clients\/([\w-]+)\/apply-payment$/, ['admin', 'accounts'], c => applyClientPayment(c.u, c.m[1], c.body));
+route('POST', /^\/api\/payments\/([\w-]+)\/clear$/, ['admin', 'accounts'], c => chequeTransition(c.u, c.m[1], 'Cleared'));
+route('POST', /^\/api\/payments\/([\w-]+)\/bounce$/, ['admin', 'accounts'], c => chequeTransition(c.u, c.m[1], 'Bounced'));
+route('POST', /^\/api\/users$/, ['admin'], c => adminUsers(c.u, 'POST', null, c.body));
+route('PUT', /^\/api\/users\/([\w-]+)$/, ['admin'], c => adminUsers(c.u, 'PUT', c.m[1], c.body));
+route('POST', /^\/api\/admin\/reset$/, ['admin'], c => resetDemo(c.u, c.body));
+route('GET', /^\/api\/audit$/, ['admin'], c => {
+  const lim = Math.min(500, parseInt(c.url.searchParams.get('limit'), 10) || 100);
+  if (c.url.searchParams.get('kind') === 'signins')
+    return { entries: st("SELECT id,ts,user_id,user_name,action,coll,rec_id,summary FROM audit WHERE org=? AND action IN ('login','login_failed','signup') ORDER BY id DESC LIMIT ?").all(ORG, lim) };
+  return { entries: st('SELECT id,ts,user_name,action,coll,rec_id,summary FROM audit WHERE org=? ORDER BY id DESC LIMIT ?').all(ORG, lim) };
+});
+/* ---------------- platform console: for the people who run TechAssures Lab itself (all labs, no database login needed) ---------------- */
+const consoleOwners = () => String(process.env.PLATFORM_ADMINS || 'work.meridiangray@gmail.com').toLowerCase().split(/[\s,;]+/).filter(Boolean);
+const consoleTeam = () => { try { return JSON.parse(withOrg('_sys', () => metaGet('console_team')) || '[]'); } catch (e) { return []; } };
+const consoleAllowed = em => consoleOwners().includes(em) || consoleTeam().some(x => x.email === em);
+function consoleAuth(c) {
+  const t = unsign(c.req.headers['x-console'] || ''); if (!t || !t.con || !consoleAllowed(t.email)) bad('Please sign in to the console again', 401);
+  return t;
+}
+const conRoute = (method, re, fn) => route(method, re, null, c => { const t = consoleAuth(c); c.who = t.email; return fn(c); });
+route('POST', /^\/api\/console\/login$/, null, async c => {
+  const g = await (c.verify || verifyGoogle)(c.body.credential);
+  if (!consoleAllowed(g.email)) bad('This Google account does not have console access. Ask the owner to add you.', 403);
+  withOrg('_sys', () => audit({ id: '', name: g.email }, 'console_login', 'console', '', 'Console sign-in · ' + whereOf(c.req, c.ip)));
+  return { token: sign({ con: 1, email: g.email, exp: Date.now() + 12 * 36e5 }), email: g.email, name: g.name, owner: consoleOwners().includes(g.email) };
+});
+const labStats = o => withOrg(o.slug, () => {
+  const inv = all('invoices'), last = st('SELECT ts FROM audit WHERE org=? ORDER BY id DESC LIMIT 1').get(o.slug);
+  return { slug: o.slug, name: o.name, plan: o.plan, createdOn: o.createdOn, ownerEmail: o.ownerEmail, suspended: !!o.suspended,
+    users: all('users').length, clients: all('clients').length, samples: all('samples').length, invoices: inv.length,
+    billed: Math.round(inv.reduce((a, x) => a + (Number(x.total) || 0), 0)), lastActive: last ? last.ts : '' };
+});
+conRoute('GET', /^\/api\/console\/overview$/, c => {
+  const labs = sysOrgs().map(labStats);
+  return { who: c.who, owner: consoleOwners().includes(c.who), labs, demo: DEMO, system: { database: pg ? 'Neon Postgres (synced)' : 'Local file only', email: N.mailOn(), webPush: true, androidPush: N.fcmOn(), publicUrl: PUBLIC_URL }, team: consoleTeam() };
+});
+const conLab = c => { const o = findOrg(c.m[1]); if (!o) bad('No such lab', 404); return o; };
+conRoute('GET', /^\/api\/console\/lab\/([\w-]+)$/, c => {
+  const o = conLab(c);
+  return withOrg(o.slug, () => ({ lab: labStats(o), colls: COLLS.map(n => ({ name: n, count: all(n).length })),
+    users: all('users').map(u => ({ id: u.id, name: u.name, role: u.role, active: u.active, login: u.login || '', email: u.email || '' })),
+    signins: st("SELECT ts,user_name,action,summary FROM audit WHERE org=? AND action IN ('login','login_failed','signup') ORDER BY id DESC LIMIT 25").all(o.slug) }));
+});
+conRoute('GET', /^\/api\/console\/lab\/([\w-]+)\/data\/(\w+)$/, c => {
+  const o = conLab(c), n = c.m[2]; if (!COLLS.includes(n)) bad('Unknown collection', 404);
+  const q = String(c.url.searchParams.get('q') || '').toLowerCase().trim();
+  let rows = withOrg(o.slug, () => all(n)).map(r => dataClean(r, false)); if (q) rows = rows.filter(r => JSON.stringify(r).toLowerCase().includes(q));
+  return { total: rows.length, rows: rows.slice(0, 100) };
+});
+conRoute('GET', /^\/api\/console\/lab\/([\w-]+)\/data\/(\w+)\/([\w-]+)$/, c => {
+  const o = conLab(c), n = c.m[2]; if (!COLLS.includes(n)) bad('Unknown collection', 404);
+  const r = withOrg(o.slug, () => get(n, c.m[3])); if (!r) bad('Not found', 404); return { rec: dataClean(r, true) };
+});
+conRoute('GET', /^\/api\/console\/lab\/([\w-]+)\/backup$/, c => {
+  const o = conLab(c), out = { lab: o.slug, exportedAt: new Date().toISOString(), data: {} };
+  withOrg(o.slug, () => COLLS.forEach(n => { out.data[n] = all(n).map(r => dataClean(r, true)); }));
+  withOrg('_sys', () => audit({ id: '', name: c.who }, 'console_backup', 'orgs', o.slug, 'Backup downloaded'));
+  return { __json: JSON.stringify(out), name: 'backup-' + o.slug + '-' + L.today() + '.json' };
+});
+conRoute('POST', /^\/api\/console\/lab\/([\w-]+)$/, c => {
+  const o = conLab(c); if (o.slug === 'demo' && c.body.suspended) bad('The demo lab cannot be suspended');
+  const n = Object.assign({}, o);
+  if (typeof c.body.suspended === 'boolean') n.suspended = c.body.suspended;
+  if (c.body.plan) n.plan = String(c.body.plan).slice(0, 20);
+  withOrg('_sys', () => { put('orgs', n, null, 'update', 'Lab ' + o.slug + (n.suspended ? ' suspended' : ' updated') + ' by ' + c.who); });
+  if (n.suspended) st('DELETE FROM sessions WHERE org=?').run(o.slug);
+  if (pg) pg.schedule();
+  return { lab: labStats(n) };
+});
+conRoute('GET', /^\/api\/console\/activity$/, c => ({ entries: st("SELECT ts,org,user_name,action,coll,summary FROM audit ORDER BY id DESC LIMIT 150").all() }));
+conRoute('POST', /^\/api\/console\/team$/, c => {
+  if (!consoleOwners().includes(c.who)) bad('Only the owner can change console access', 403);
+  const email = String(c.body.email || '').trim().toLowerCase(); if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) bad('Enter a valid Google email');
+  let team = consoleTeam().filter(x => x.email !== email);
+  if (!c.body.remove) team.push({ email, name: String(c.body.name || '').slice(0, 60), addedOn: L.today() });
+  withOrg('_sys', () => metaSet('console_team', JSON.stringify(team)));
+  if (pg) pg.schedule();
+  return { team };
+});
+
+/* Data browser for the lab's own admin: look through everything stored for this lab, no database login needed */
+const dataClean = (r, full) => {
+  const walk = v => {
+    if (typeof v === 'string') return (!full && v.length > 240) ? (v.startsWith('data:') ? '[file ' + Math.round(v.length / 1024) + ' KB]' : v.slice(0, 240) + '…') : v;
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v)) { if (k === 'hash' || k === 'salt') continue; o[k] = walk(v[k]); } return o; }
+    return v;
+  };
+  return walk(r);
+};
+route('GET', /^\/api\/data$/, ['admin'], c => ({ colls: COLLS.filter(n => n !== 'notifications' || true).map(n => ({ name: n, count: all(n).length })) }));
+route('GET', /^\/api\/data\/(\w+)$/, ['admin'], c => {
+  const n = c.m[1]; if (!COLLS.includes(n)) bad('Unknown collection', 404);
+  const q = String(c.url.searchParams.get('q') || '').toLowerCase().trim(), lim = Math.min(200, parseInt(c.url.searchParams.get('limit'), 10) || 50), off = parseInt(c.url.searchParams.get('offset'), 10) || 0;
+  let rows = all(n).map(r => dataClean(r, false));
+  if (q) rows = rows.filter(r => JSON.stringify(r).toLowerCase().includes(q));
+  return { total: rows.length, rows: rows.slice(off, off + lim) };
+});
+route('GET', /^\/api\/data\/(\w+)\/([\w-]+)$/, ['admin'], c => {
+  const n = c.m[1]; if (!COLLS.includes(n)) bad('Unknown collection', 404);
+  const r = get(n, c.m[2]); if (!r) bad('Not found', 404);
+  return { rec: dataClean(r, true) };
+});
+route('GET', /^\/api\/backup$/, ['admin'], c => {
+  const out = { lab: ORG, exportedAt: new Date().toISOString(), data: {} };
+  COLLS.forEach(n => { out.data[n] = all(n).map(r => dataClean(r, true)); });
+  return { __json: JSON.stringify(out), name: 'backup-' + ORG + '-' + L.today() + '.json' };
+});
+route('GET', /^\/api\/export\/(\w+)\.csv$/, ['admin', 'accounts'], c => {
+  const coll = c.m[1]; if (!(CSV_ROLES[c.u.role] || []).includes(coll)) bad('You cannot export ' + coll, 403);
+  return { __csv: toCsv(coll), name: coll + '-' + L.today() + '.csv' };
+});
+route('POST', /^\/api\/tickets$/, '*', c => ticketCreate(c.u, c.body));
+route('POST', /^\/api\/tickets\/([\w-]+)$/, '*', c => ticketAct(c.u, c.m[1], c.body));
+route('POST', /^\/api\/notifications\/read$/, '*', c => {
+  const ids = Array.isArray(c.body.ids) ? new Set(c.body.ids.map(String)) : null;
+  let n = 0;
+  tx(() => all('notifications').filter(x => x.userId === c.u.id && !x.read && (!ids || ids.has(x.id))).forEach(x => { x.read = true; putQuiet('notifications', x); n++; }));
+  return { ok: true, marked: n };
+});
+route('PUT', /^\/api\/(\w+)\/([\w-]+)$/, '*', c => genericSave(c.u, c.m[1], c.m[2], c.body));
+route('POST', /^\/api\/(\w+)$/, '*', c => genericSave(c.u, c.m[1], null, c.body));
+route('DELETE', /^\/api\/(\w+)\/([\w-]+)$/, '*', c => {
+  const coll = c.m[1], g = GENERIC[coll];
+  if (!g) bad('Unknown collection', 404);
+  if (!g.roles.includes(c.u.role)) bad('Your role cannot change ' + coll, 403);
+  if (coll === 'projects') { if (c.u.role !== 'admin') bad('Only an admin can delete a project', 403); if (all('samples').some(s => s.projectId === c.m[2])) bad('This project has samples and cannot be deleted', 409); }
+  else if (!g.deletable) bad('This record cannot be deleted', 405);
+  return tx(() => ({ ok: del(coll, c.m[2], c.u) }));
+});
+
+/* ---------------- http ---------------- */
+function clientIp(req) {                 /* behind Render's proxy the real address is the first X-Forwarded-For entry */
+  const xf = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return (xf || req.socket.remoteAddress || '').replace(/^::ffff:/, '').slice(0, 45);
+}
+function deviceOf(req) {
+  const ua = String(req.headers['user-agent'] || '');
+  const os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iOS/i.test(ua) ? 'iPhone/iPad' : /Windows/i.test(ua) ? 'Windows' : /Mac OS X|Macintosh/i.test(ua) ? 'Mac' : /Linux/i.test(ua) ? 'Linux' : 'Unknown device';
+  const br = /; wv\)|Version\/[\d.]+ Chrome/i.test(ua) && /Android/i.test(ua) ? 'app/webview' : /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'browser';
+  return os + ' ' + br;
+}
+const whereOf = (req, ip) => deviceOf(req) + ' · ' + ip + (req.headers['cf-ipcountry'] && req.headers['cf-ipcountry'] !== 'XX' ? ' · ' + req.headers['cf-ipcountry'] : '');
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
+const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline' https://accounts.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://*.googleusercontent.com; connect-src 'self' https://accounts.google.com; frame-src https://accounts.google.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+function secure(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('Content-Security-Policy', CSP);
+}
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let n = 0; const chunks = [];
+    req.on('data', d => { n += d.length; if (n > BODY_LIMIT) { reject(new ApiError(413, 'Request is too large')); req.destroy(); } else chunks.push(d); });
+    req.on('end', () => {
+      if (!chunks.length) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (e) { reject(new ApiError(400, 'Body is not valid JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+const hesc = x => String(x == null ? '' : x).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function verifyPage(res, slug, sid) {
+  const org = findOrg(slug), s = org && withOrg(org.slug, () => get('samples', sid));
+  const t = s && withOrg(org.slug, () => get('tests', s.testId));
+  const good = s && ['approved', 'sent'].includes(s.reportStatus);
+  const row = (k, v) => '<tr><th>' + k + '</th><td>' + hesc(v || '-') + '</td></tr>';
+  const html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Report verification</title><style>body{font:16px/1.5 system-ui,sans-serif;background:#f3f6fb;margin:0;color:#16233b}main{max-width:480px;margin:0 auto;padding:24px 16px}.c{background:#fff;border-radius:14px;padding:20px;box-shadow:0 1px 4px #0002}.ok{color:#0a7a3d}.no{color:#b3261e}h1{font-size:20px;margin:0 0 4px}table{width:100%;border-collapse:collapse;margin-top:12px}th{text-align:left;color:#6b7790;font-weight:500;padding:6px 8px 6px 0;width:40%}td{padding:6px 0}tr+tr{border-top:1px solid #e5eaf2}p{color:#6b7790;font-size:13px}</style></head><body><main><div class="c">' +
+    (good ? '<h1 class="ok">&#10003; Genuine report</h1><div>Issued by ' + hesc(org.name) + '</div><table>' + row('Report no.', s.reportNo) + row('Date of issue', s.approvedOn) + row('Test', t && t.name) + row('Identification', s.mark) + row('ULR', s.ulr) + row('Approved by', s.approvedBy) + '</table><p>This confirms the report was issued by the laboratory. Compare the details above with your printed copy. Customer details and results are not shown here.</p>'
+      : '<h1 class="no">Report not found</h1><p>This code does not match an issued report. If you hold a printed copy, treat it as unverified and contact the laboratory.</p>') + '</div></main></body></html>';
+  res.writeHead(good ? 200 : 404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(html);
+}
+function serveStatic(req, res, url) {
+  let p = decodeURIComponent(url.pathname); if (p === '/') p = '/index.html'; if (p === '/console') p = '/console.html';
+  const file = path.join(PUBLIC_DIR, p);
+  if (!file.startsWith(PUBLIC_DIR + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
+  res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+  fs.createReadStream(file).pipe(res);
+}
+const server = http.createServer(async (req, res) => {
+  secure(res);
+  const url = new URL(req.url, 'http://x');
+  if (!url.pathname.startsWith('/api/')) {
+    const vm = /^\/v\/([\w-]+)\/([\w-]+)$/.exec(url.pathname);
+    if (vm && req.method === 'GET') { await ready; return verifyPage(res, vm[1], vm[2]); }
+    if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
+    try { return serveStatic(req, res, url); } catch (e) { res.writeHead(400); return res.end('Bad request'); }
+  }
+  try {
+    await ready;
+    const ip = clientIp(req);
+    let hit = null, m = null;
+    for (const r of routes) { if (r.method !== req.method) continue; m = r.re.exec(url.pathname); if (m) { hit = r; break; } }
+    if (!hit) bad('No such endpoint', 404);
+    let u = null;
+    if (hit.roles) {
+      u = authUser(req); if (!u) bad('Please log in again', 401);
+      if (hit.roles !== '*' && !hit.roles.includes(u.role)) bad('Your role cannot do this', 403);
+    }
+    const body = (req.method === 'GET' || req.method === 'DELETE') ? {} : await readBody(req);
+    if (u) ORG = u.org;
+    const out = await hit.fn({ req, res, u, m, url, body, ip, verify: module.exports.__verify });
+    if (out && out.__json != null) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="' + out.name + '"', 'Cache-Control': 'no-store' });
+      return res.end(out.__json);
+    }
+    if (out && out.__csv != null) {
+      res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="' + out.name + '"', 'Cache-Control': 'no-store' });
+      return res.end(out.__csv);
+    }
+    if (pg && req.method !== 'GET') pg.schedule();
+    ok(res, 200, out);
+  } catch (e) {
+    if (e instanceof ApiError) return ok(res, e.status, { error: e.message });
+    console.error(new Date().toISOString(), req.method, req.url, e);
+    ok(res, 500, { error: 'Something went wrong on the server' });
+  }
+});
+setInterval(() => { try { st('DELETE FROM sessions WHERE expires<?').run(Date.now()); } catch (e) { /* ignore */ } }, 3600e3).unref();
+setInterval(() => { ready.then(() => scanDue()).catch(e => console.error('scanDue', e.message)); }, 5 * 60e3).unref();
+if (require.main === module) {
+  ready.then(() => scanDue()).catch(() => {});
+  server.listen(PORT, HOST, () => console.log('TechAssures Lab on http://' + (HOST === '0.0.0.0' ? 'localhost' : HOST) + ':' + PORT + '  (db: ' + (DATABASE_URL ? 'postgres' : DB_PATH) + ', demo mode: ' + (DEMO ? 'on' : 'off') + ')'));
+  const stop = async () => { if (pg) { try { await pg.flush(); } catch (e) { /* ignore */ } } server.close(() => { try { db.close(); } catch (e) { /* ignore */ } process.exit(0); }); setTimeout(() => process.exit(0), 3000).unref(); };
+  process.on('SIGINT', stop); process.on('SIGTERM', stop);
+}
+module.exports = { server, __scanDue: scanDue, __verify: null, __setKeys: k => { google.jwks = k; google.at = Date.now(); }, __clientId: () => GOOGLE_CLIENT_ID };
