@@ -2,13 +2,18 @@ name: Unzip tamaterial-main-all-ui-ux-fixed.zip
 on:
   workflow_dispatch:
 
+# request write permission for contents
+permissions:
+  contents: write
+
 jobs:
   unzip-and-commit:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (with token)
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
           fetch-depth: 0
 
